@@ -122,11 +122,11 @@ let showDebug = false;
 // TUNABLE SYSTEM CONFIGURATION & PARAMETERS
 // -------------------------------------------------------------
 const CONFIG = {
-  SQUAT_THRESHOLD: 0.48,            // Confidence threshold to trigger SQUATTING
+  SQUAT_THRESHOLD: 0.45,            // Confidence threshold to trigger SQUATTING
   IDLE_THRESHOLD: 0.55,             // Confidence threshold to trigger IDLE
-  RUNNING_THRESHOLD: 0.60,          // Confidence threshold to trigger RUNNING (False negative preferred)
+  RUNNING_THRESHOLD: 0.62,          // Confidence threshold to trigger RUNNING (False negative preferred)
   JUMP_THRESHOLD: 0.50,             // Confidence threshold to trigger JUMPING
-  MOVEMENT_DEADZONE: 0.25,          // Velocity dead-zone below which motion score is strictly 0
+  MOVEMENT_DEADZONE: 0.28,          // Leg velocity dead-zone below which running score is strictly 0
   STATE_CONFIRMATION_FRAMES: 3,     // Debounce frames required for posture transitions
   RUNNING_CONFIRMATION_FRAMES: 5,   // Debounce frames to confirm RUNNING (~0.16s)
   JUMP_CONFIRMATION_FRAMES: 3       // Debounce frames to confirm JUMPING
@@ -209,7 +209,7 @@ class BodyPoseClassifier {
     this.prevHipYNorm = null;
     this.prevVisualX = 0.5;
     
-    // Joint landmark history for motion velocity
+    // Joint landmark history for motion velocity (LOWER BODY EXCLUSIVE)
     this.prevLA = null;
     this.prevRA = null;
     this.prevLK = null;
@@ -356,7 +356,7 @@ class BodyPoseClassifier {
     }
 
     // ---------------------------------------------------------
-    // LOWER-BODY LEG MOTION VELOCITY (DEAD-ZONE GUARD)
+    // LOWER-BODY LEG MOTION VELOCITY (EXCLUDES HANDS/ARMS 100%)
     // ---------------------------------------------------------
     const leftAnkleVel = LA && this.prevLA ? dist(LA, this.prevLA) / (dt * scale) : 0;
     const rightAnkleVel = RA && this.prevRA ? dist(RA, this.prevRA) / (dt * scale) : 0;
@@ -385,35 +385,43 @@ class BodyPoseClassifier {
     this.smooth.idle = this.conf.idle;
 
     // 2. SQUAT CONFIDENCE: Lower-body squat geometry (reduced hip height, bent knees)
+    // POSTURE-BASED: Evaluates posture regardless of motion speed or holding still!
     const kneeFlexion = Math.max(0, this.baseline.kneeAngle - avgKneeAngle);
-    const kneeFlexionScore = clamp(kneeFlexion / 22, 0, 1); // 22 deg drop gives full score
+    const kneeFlexionScore = clamp(kneeFlexion / 20, 0, 1); // 20 deg drop gives full score
     const hipDrop = Math.max(0, smoothedHipYNorm - this.baseline.hipYNorm);
-    const hipDropScore = clamp(hipDrop / 0.14, 0, 1);
+    const hipDropScore = clamp(hipDrop / 0.12, 0, 1);
     const legCompression = Math.max(0, this.baseline.legDistNorm - currentLegDistNorm);
-    const legCompressionScore = clamp(legCompression / 0.14, 0, 1);
+    const legCompressionScore = clamp(legCompression / 0.12, 0, 1);
 
     const rawSquatConfidence = kneeFlexionScore * 0.45 + hipDropScore * 0.35 + legCompressionScore * 0.20;
     this.conf.squat = ema(this.smooth.squat, rawSquatConfidence, 0.35);
     this.smooth.squat = this.conf.squat;
 
-    // 3. RUNNING CONFIDENCE: Sustained leg motion velocity + leg alternation
+    // 3. RUNNING CONFIDENCE: Sustained leg motion velocity + leg alternation gait
     let rawRunningConfidence = 0;
+    
+    // STRICT GUARDS FOR RUNNING:
+    // Guard A: Landing cooldown after jump
+    // Guard B: Squat Posture Guard (if squat posture active, running IS ZERO!)
+    // Guard C: Motion Deadzone Guard (leg velocity < 0.28, running IS ZERO!)
     if (this.jumpCooldownFrames > 0) {
       this.jumpCooldownFrames--;
-      rawRunningConfidence = 0; // POST-JUMP LANDING GUARD: Force running to 0 during landing
+      rawRunningConfidence = 0;
+    } else if (this.conf.squat >= 0.40 || this.squatFrames > 0) {
+      rawRunningConfidence = 0; // Squat posture strictly beats running!
     } else if (avgLegMotionVel >= CONFIG.MOVEMENT_DEADZONE) {
-      const motionScore = clamp((avgLegMotionVel - CONFIG.MOVEMENT_DEADZONE) / 0.60, 0, 1);
+      const motionScore = clamp((avgLegMotionVel - CONFIG.MOVEMENT_DEADZONE) / 0.55, 0, 1);
       const kneeYDiff = (LK && RK) ? Math.abs(LK.y - RK.y) / scale : 0;
-      const kneeHeightScore = clamp(kneeYDiff / 0.14, 0, 1);
+      const kneeHeightScore = clamp(kneeYDiff / 0.12, 0, 1);
       const velAsymmetry = Math.abs(leftAnkleVel - rightAnkleVel);
-      const velAsymmetryScore = clamp(velAsymmetry / 0.45, 0, 1);
+      const velAsymmetryScore = clamp(velAsymmetry / 0.40, 0, 1);
 
-      rawRunningConfidence = motionScore * 0.45 + velAsymmetryScore * 0.35 + kneeHeightScore * 0.20;
+      rawRunningConfidence = motionScore * 0.40 + velAsymmetryScore * 0.40 + kneeHeightScore * 0.20;
     } else {
       rawRunningConfidence = 0;
     }
 
-    // Guard: If standing upright with minimal motion, running confidence IS strictly ZERO
+    // Standing still / arm-only motion guard
     if (this.conf.idle > 0.65 && avgLegMotionVel < (CONFIG.MOVEMENT_DEADZONE * 1.4)) {
       rawRunningConfidence = 0;
     }
@@ -422,6 +430,7 @@ class BodyPoseClassifier {
     this.smooth.running = this.conf.running;
 
     // 4. JUMP CONFIDENCE: Ground baseline elevation & rapid upward velocity
+    // ARMS/HANDS IGNORED 100%: Evaluates feet/ankle baseline elevation + vertical hip velocity
     const ankleRiseLeft = LA ? (this.baseline.ankleYNorm - LA.y / scale) : 0;
     const ankleRiseRight = RA ? (this.baseline.ankleYNorm - RA.y / scale) : 0;
     
@@ -431,19 +440,20 @@ class BodyPoseClassifier {
     if (RA) { ankleRiseSum += ankleRiseRight; validAnkleCount++; }
     const avgAnkleRise = validAnkleCount > 0 ? ankleRiseSum / validAnkleCount : 0;
 
-    const feetGrounded = avgAnkleRise < 0.14;
-    const feetAirborne = avgAnkleRise > 0.16 || (ankleRiseLeft > 0.11 && ankleRiseRight > 0.11);
-    const upwardVelScore = clamp(this.verticalVelocity / 0.50, 0, 1);
+    const feetGrounded = avgAnkleRise < 0.12;
+    const feetAirborne = avgAnkleRise > 0.14 || (ankleRiseLeft > 0.10 && ankleRiseRight > 0.10);
+    const upwardVelScore = clamp(this.verticalVelocity / 0.45, 0, 1);
 
     const rawJumpConfidence = feetAirborne 
-      ? (clamp(avgAnkleRise / 0.16, 0, 1) * 0.60 + Math.max(0, upwardVelScore) * 0.40)
-      : (this.verticalVelocity > 0.60 && avgAnkleRise > 0.08 ? 0.65 : 0.0);
+      ? (clamp(avgAnkleRise / 0.14, 0, 1) * 0.65 + Math.max(0, upwardVelScore) * 0.35)
+      : (this.verticalVelocity > 0.55 && avgAnkleRise > 0.08 ? 0.60 : 0.0);
 
     this.conf.jump = ema(this.smooth.jump, rawJumpConfidence, 0.35);
     this.smooth.jump = this.conf.jump;
 
-    // Dynamic Baseline Refinement when stable IDLE stance is held
-    if (this.visibleState === "IDLE" && Math.abs(this.verticalVelocity) < 0.15 && this.conf.idle > 0.80 && feetGrounded) {
+    // Dynamic Baseline Refinement: Refines standing baseline ONLY when in stable IDLE stance
+    // Strictly BLOCKED during SQUATTING to prevent decaying squat posture!
+    if (this.visibleState === "IDLE" && Math.abs(this.verticalVelocity) < 0.15 && this.conf.idle > 0.85 && this.conf.squat < 0.25 && feetGrounded) {
       this.baseline.hipYNorm = ema(this.baseline.hipYNorm, currentHipYNorm, 0.005);
       this.baseline.kneeAngle = ema(this.baseline.kneeAngle, avgKneeAngle, 0.005);
       this.baseline.ankleYNorm = ema(this.baseline.ankleYNorm, currentAnkleYNorm, 0.005);
@@ -460,17 +470,18 @@ class BodyPoseClassifier {
       this.airborneFrames = Math.max(0, this.airborneFrames - 1);
     }
 
-    if (this.conf.running >= CONFIG.RUNNING_THRESHOLD && this.airborneFrames === 0 && feetGrounded && this.jumpCooldownFrames === 0) {
+    if (this.conf.squat >= CONFIG.SQUAT_THRESHOLD && this.airborneFrames === 0) {
+      this.squatFrames = clamp(this.squatFrames + 2, 0, 10);
+      this.idleFrames = 0;
+      this.runningFrames = 0; // Squat posture clears running frames!
+    } else {
+      this.squatFrames = Math.max(0, this.squatFrames - 1);
+    }
+
+    if (this.conf.running >= CONFIG.RUNNING_THRESHOLD && this.airborneFrames === 0 && this.squatFrames === 0 && feetGrounded && this.jumpCooldownFrames === 0) {
       this.runningFrames = clamp(this.runningFrames + 2, 0, 10);
     } else {
       this.runningFrames = Math.max(0, this.runningFrames - 1);
-    }
-
-    if (this.conf.squat >= CONFIG.SQUAT_THRESHOLD && this.airborneFrames === 0) {
-      this.squatFrames = clamp(this.squatFrames + 1, 0, 10);
-      this.idleFrames = 0;
-    } else {
-      this.squatFrames = Math.max(0, this.squatFrames - 1);
     }
 
     if (this.conf.idle >= CONFIG.IDLE_THRESHOLD && this.squatFrames === 0 && this.runningFrames === 0) {
@@ -481,23 +492,24 @@ class BodyPoseClassifier {
 
     // ---------------------------------------------------------
     // HIERARCHICAL VISIBLE STATE SELECTION (STRICT 12 VISIBLE STATES)
-    // Priorities:
-    // 1. JUMPING  (Airborne elevation confirmed) -> Triggers jumpCooldownFrames = 15 on landing
-    // 2. RUNNING  (Sustained leg motion pattern confirmed)
-    // 3. SQUATTING (Lower body squat posture confirmed)
-    // 4. IDLE     (Standing posture confirmed)
+    // Posture & Airborne Elevation ALWAYS beat generic motion!
+    // Priority:
+    // 1. JUMPING  (Airborne feet elevation confirmed)
+    // 2. SQUATTING (Lower-body squat posture confirmed - POSTURE BEATS MOTION!)
+    // 3. RUNNING  (Sustained lower-body leg motion pattern confirmed - NON-SQUATTING ONLY)
+    // 4. IDLE     (Standing upright posture confirmed - Allows arm movements & body sway)
     // ---------------------------------------------------------
     if (this.airborneFrames >= CONFIG.JUMP_CONFIRMATION_FRAMES) {
       this.visibleState = "JUMPING";
-      this.jumpCooldownFrames = 15; // Set 15-frame landing cooldown to block RUNNING flicker
+      this.jumpCooldownFrames = 15; // Set 15-frame landing cooldown
+    } else if (this.squatFrames >= CONFIG.STATE_CONFIRMATION_FRAMES && this.jumpCooldownFrames === 0) {
+      this.visibleState = "SQUATTING"; // SQUATTING POSTURE BEATS RUNNING!
     } else if (this.runningFrames >= CONFIG.RUNNING_CONFIRMATION_FRAMES && this.jumpCooldownFrames === 0) {
       this.visibleState = "RUNNING";
-    } else if (this.squatFrames >= CONFIG.STATE_CONFIRMATION_FRAMES && this.jumpCooldownFrames === 0) {
-      this.visibleState = "SQUATTING";
     } else if (this.idleFrames >= CONFIG.STATE_CONFIRMATION_FRAMES) {
       this.visibleState = "IDLE";
     } else {
-      // Hold previous confirmed state during smooth transitions (NO STANDING UP state label)
+      // Hold previous confirmed state during smooth transitions
       this.visibleState = this.visibleState || "IDLE";
     }
 
