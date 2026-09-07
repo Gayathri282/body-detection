@@ -122,17 +122,28 @@ let showDebug = false;
 // TUNABLE SYSTEM CONFIGURATION & PARAMETERS
 // -------------------------------------------------------------
 const CONFIG = {
-  SQUAT_ENTER_DELTA: -0.08,         // Head/hip vertical displacement threshold to ENTER squat (Y down is negative)
-  SQUAT_EXIT_DELTA: -0.03,          // Head/hip vertical displacement threshold to EXIT squat
-  JUMP_ENTER_DELTA: 0.08,           // Head/hip vertical displacement threshold to ENTER jump
-  SQUAT_THRESHOLD: 0.45,            // Confidence threshold for SQUATTING
-  IDLE_THRESHOLD: 0.55,             // Confidence threshold for IDLE
-  RUNNING_THRESHOLD: 0.60,          // Confidence threshold for RUNNING (False negative preferred)
-  JUMP_THRESHOLD: 0.50,             // Confidence threshold for JUMPING
-  MOVEMENT_DEADZONE: 0.28,          // Lower-body leg velocity dead-zone below which running score is 0
-  STATE_CONFIRMATION_FRAMES: 3,     // Debounce frames required for posture transitions
-  RUNNING_CONFIRMATION_FRAMES: 5,   // Debounce frames to confirm RUNNING (~0.16s)
-  JUMP_CONFIRMATION_FRAMES: 3       // Debounce frames to confirm JUMPING
+  // SQUAT: Pure knee-angle + thigh-geometry based
+  // Standing knee angle is typically 165-180°. Squat bends it to 80-140°.
+  SQUAT_KNEE_ENTER: 145,            // BOTH knees below this angle = entering squat
+  SQUAT_KNEE_EXIT: 155,             // BOTH knees above this angle = exiting squat
+  SQUAT_THIGH_DEV_MIN: 8,           // Minimum thigh angle deviation (degrees) from standing to count as secondary squat signal
+  SQUAT_CONFIRMATION_FRAMES: 6,     // Frames of sustained squat evidence before switching to SQUATTING
+  SQUAT_EXIT_FRAMES: 6,             // Frames of sustained non-squat evidence before exiting SQUATTING
+  
+  // JUMP: Hip/ankle elevation based  
+  JUMP_HIP_RISE: 0.04,             // hipDeltaNorm above this = potential jump
+  JUMP_ANKLE_RISE: 0.08,           // avgAnkleRise above this = feet off ground
+  JUMP_CONFIRMATION_FRAMES: 2,     // Frames needed to confirm jump
+  JUMP_COOLDOWN: 12,               // Frames of cooldown after jump ends
+  
+  // RUNNING: Gait cycle based
+  GAIT_FLIP_THRESHOLD: 0.02,       // Ankle Y diff threshold for gait sign flip (normalized)
+  GAIT_FLIPS_REQUIRED: 2,          // Min gait flips in buffer for running
+  RUNNING_LEG_VEL_MIN: 0.10,       // Min avg leg velocity for running
+  RUNNING_CONFIRMATION_FRAMES: 4,  // Frames needed to confirm running
+  
+  // General
+  STATE_HOLD_FRAMES: 5,            // Min frames to hold a state before allowing transition out
 };
 
 // -------------------------------------------------------------
@@ -163,11 +174,12 @@ function calculateAngle(A, B, C) {
   return deg;
 }
 
-// Calculates thigh angle relative to vertical axis (0 deg = straight down, 90 deg = horizontal)
-function calculateThighAngle(hip, knee) {
+// Calculates thigh angle: angle of HIP→KNEE vector relative to vertical (0° = straight down, 90° = horizontal)
+// During standing, thigh hangs nearly straight (~5-10°). During squatting, it angles outward (30-70°+).
+function calculateThighDeviation(hip, knee) {
   if (!hip || !knee) return 0;
   const dx = Math.abs(knee.x - hip.x);
-  const dy = Math.max(0.001, knee.y - hip.y);
+  const dy = Math.max(0.001, knee.y - hip.y); // Positive = knee is below hip (normal)
   return (Math.atan2(dx, dy) * 180) / Math.PI;
 }
 
@@ -180,14 +192,16 @@ class BodyPoseClassifier {
   }
 
   reset() {
-    this.internalState = "UNKNOWN"; // UNKNOWN, CALIBRATING, IDLE, SQUATTING, JUMPING, RUNNING
-    this.visibleState = "IDLE";    // ONLY: IDLE, SQUATTING, JUMPING, RUNNING
-    this.position = "CENTER";      // ONLY: LEFT, CENTER, RIGHT
+    this.visibleAction = "IDLE";      // IDLE, SQUATTING, JUMPING, RUNNING (visible UI state)
+    this.candidateAction = "IDLE";    // Internal candidate action
+    this.position = "CENTER";         // LEFT, CENTER, RIGHT
+    this.jumpEventState = "GROUND";   // GROUND, TAKEOFF_CANDIDATE, AIRBORNE, LANDING (internal jump state machine)
+
     this.calibrated = false;
     this.calibrationFrames = 0;
     this.targetCalibrationFrames = 45; // ~1.5s baseline standing calibration
 
-    // Rolling Temporal Pose Buffer (~1 second history window, 30 frames at 30 FPS)
+    // Rolling Temporal Pose Buffer (~1 second history window)
     this.poseBuffer = [];
     this.bufferCapacity = 30;
 
@@ -196,385 +210,465 @@ class BodyPoseClassifier {
       headYNorm: null,
       hipYNorm: null,
       ankleYNorm: null,
-      kneeAngle: 168,
-      legDistNorm: null,
-      bodyHeightNorm: null
+      kneeAngle: null,
+      thighDev: null,
+      hipToAnkleNorm: null,
     };
 
-    // Temporal confidence scores
-    this.conf = {
-      idle: 0,
-      squat: 0,
-      jump: 0,
-      running: 0
-    };
-
-    // Smoothing & history buffers
-    this.smooth = { visualX: null, headY: null, hipY: null, idle: null, squat: null, running: null, jump: null };
+    // Smoothing & previous frame tracking
+    this.smooth = { visualX: null, hipY: null, kneeAngle: null };
     this.lastTimestamp = null;
     this.prevHipYNorm = null;
-    this.prevVisualX = 0.5;
-    
-    // Joint landmark history for motion velocity (LOWER BODY EXCLUSIVE)
+
     this.prevLA = null;
     this.prevRA = null;
     this.prevLK = null;
     this.prevRK = null;
-    
+
     this.verticalVelocity = 0;
-    this.horizontalVelocity = 0;
+    this.leftAnkleVel = 0;
+    this.rightAnkleVel = 0;
+    this.leftKneeVel = 0;
+    this.rightKneeVel = 0;
+    this.leftHipVel = 0;
+    this.rightHipVel = 0;
     this.avgLegMotionVel = 0;
-    
-    // Player-relative vertical displacement metrics
-    this.headDeltaNorm = 0;
-    this.hipDeltaNorm = 0;
-    
-    // Debounce & cooldown counters
-    this.idleFrames = 0;
+
+    // Debounce & state stability counters
     this.squatFrames = 0;
     this.airborneFrames = 0;
     this.runningFrames = 0;
     this.jumpCooldownFrames = 0;
+    this.stateHoldCounter = 0;
     this.missingPersonFrames = 0;
-    
-    // Raw telemetry for debug overlay
+
+    // Confidence metrics for debug / classification engine
+    this.confidence = {
+      idle: 100,
+      squat: 0,
+      jump: 0,
+      run: 0
+    };
+
     this.telemetry = {};
   }
 
   triggerRecalibration() {
     this.calibrated = false;
     this.calibrationFrames = 0;
-    this.internalState = "CALIBRATING";
   }
 
-  // ROBUST PERSON DETECTION: Checks for core torso presence (Shoulders 11,12 & Hips 23,24)
-  // Does NOT depend on lower ankle visibility, preventing false NO PERSON when standing still/centered!
+  // ── PERSON PRESENCE CHECK ──
   checkPersonPresence(lm) {
     if (!lm || lm.length < 25) return false;
-    
     const LS = lm[11], RS = lm[12], LH = lm[23], RH = lm[24];
     const vis = (pt) => pt && (pt.visibility ?? 1) > 0.20;
-    
     const hasTorso = (vis(LS) || vis(RS)) && (vis(LH) || vis(RH));
-    
     if (hasTorso) {
       this.missingPersonFrames = 0;
       return true;
     } else {
       this.missingPersonFrames++;
-      // 30-frame (~1s) hangover window before declaring NO PERSON
-      return this.missingPersonFrames <= 30;
+      return this.missingPersonFrames <= 30; // Buffer missing frames so head/feet out of frame during jump/squat doesn't drop person!
     }
   }
 
+  // ── 1. INDEPENDENT POSITION CLASSIFIER ──
+  classifyPosition(lm) {
+    const LS = lm[11], RS = lm[12];
+    const LH = lm[23], RH = lm[24];
+    const shoulderCenter = mid(LS, RS);
+    const hipCenter = mid(LH, RH);
+    const bodyCenterX = (shoulderCenter.x + hipCenter.x) / 2;
+
+    // Convert to visual screen coordinates (mirror-compensated)
+    const visualX = 1 - bodyCenterX;
+    const smoothedVisualX = ema(this.smooth.visualX, visualX, 0.3);
+    this.smooth.visualX = smoothedVisualX;
+
+    if (smoothedVisualX < 0.33) return "LEFT";
+    if (smoothedVisualX > 0.67) return "RIGHT";
+    return "CENTER";
+  }
+
+  calculateLegPhaseRelationship() {
+    if (this.poseBuffer.length < 5) return { inPhaseScore: 0, outOfPhaseScore: 0 };
+    
+    let inPhaseCount = 0;
+    let outOfPhaseCount = 0;
+    let totalSamples = 0;
+
+    for (let i = 1; i < this.poseBuffer.length; i++) {
+      const prev = this.poseBuffer[i - 1];
+      const curr = this.poseBuffer[i];
+
+      const leftDY = (prev.leftAnkleY != null && curr.leftAnkleY != null) ? (prev.leftAnkleY - curr.leftAnkleY) : 0;
+      const rightDY = (prev.rightAnkleY != null && curr.rightAnkleY != null) ? (prev.rightAnkleY - curr.rightAnkleY) : 0;
+
+      const magL = Math.abs(leftDY);
+      const magR = Math.abs(rightDY);
+
+      if (magL > 0.003 || magR > 0.003) {
+        totalSamples++;
+        if ((leftDY >= 0 && rightDY >= 0) || (leftDY <= 0 && rightDY <= 0)) {
+          inPhaseCount++;
+        } else {
+          outOfPhaseCount++;
+        }
+      }
+    }
+
+    return {
+      inPhaseScore: totalSamples > 0 ? inPhaseCount / totalSamples : 0,
+      outOfPhaseScore: totalSamples > 0 ? outOfPhaseCount / totalSamples : 0,
+    };
+  }
+
+  // ── 2. INDEPENDENT ACTION CLASSIFIER & MAIN FRAME PROCESSOR ──
   processFrame(lm, timestamp) {
     if (!this.checkPersonPresence(lm)) {
-      this.internalState = "UNKNOWN";
       return { label: "NO PERSON", state: "NO PERSON", position: "CENTER" };
     }
 
-    // Key Landmarks
-    const NOSE = lm[0];             // Head reference
+    // Extract core skeleton landmarks
+    const NOSE = lm[0];
     const LS = lm[11], RS = lm[12]; // Shoulders
     const LH = lm[23], RH = lm[24]; // Hips
     const LK = lm[25], RK = lm[26]; // Knees
     const LA = lm[27], RA = lm[28]; // Ankles
 
-    const headPt = (NOSE && (NOSE.visibility ?? 1) > 0.2) ? NOSE : mid(LS, RS);
+    // Determine horizontal position independently
+    this.position = this.classifyPosition(lm);
+
+    // Torso length scale normalization
     const shoulderMid = mid(LS, RS);
     const hipMid = mid(LH, RH);
-    const kneeMid = mid(LK, RK);
     const ankleMid = mid(LA, RA);
-
-    // Visual horizontal position (scaleX(-1) mirror compensated)
-    const rawBodyCenterX = (shoulderMid.x + hipMid.x) / 2;
-    const visualX = 1 - rawBodyCenterX;
-    const smoothedVisualX = ema(this.smooth.visualX, visualX, 0.3);
-    this.smooth.visualX = smoothedVisualX;
-
-    const position = this.classifyPosition(smoothedVisualX);
-    this.position = position;
-
-    // SCALE NORMALIZATION: Torso length is the primary scale invariant factor
     const torsoLen = Math.max(0.06, dist(shoulderMid, hipMid));
-    const scale = torsoLen;
 
-    // Normalized Landmarks & Geometry
-    const currentHeadYNorm = headPt.y / scale;
-    const currentHipYNorm = hipMid.y / scale;
-    const currentAnkleYNorm = ankleMid.y / scale;
-    const currentLegDistNorm = dist(hipMid, ankleMid) / scale;
-    const currentBodyHeightNorm = dist(headPt, ankleMid) / scale;
+    const headPt = (NOSE && (NOSE.visibility ?? 1) > 0.2) ? NOSE : shoulderMid;
+    const currentHeadYNorm = headPt.y / torsoLen;
+    const currentHipYNorm = hipMid.y / torsoLen;
+    const currentAnkleYNorm = ankleMid.y / torsoLen;
+    const currentHipToAnkleNorm = dist(hipMid, ankleMid) / torsoLen;
 
+    // Knee interior angles (HIP → KNEE → ANKLE)
     const visLK = (LK?.visibility ?? 1) > 0.25;
     const visRK = (RK?.visibility ?? 1) > 0.25;
-
     const leftKneeAngle = visLK ? calculateAngle(LH, LK, LA) : null;
     const rightKneeAngle = visRK ? calculateAngle(RH, RK, RA) : null;
 
-    let validKneeCount = 0;
-    let kneeSum = 0;
+    let validKneeCount = 0, kneeSum = 0;
     if (leftKneeAngle != null) { kneeSum += leftKneeAngle; validKneeCount++; }
     if (rightKneeAngle != null) { kneeSum += rightKneeAngle; validKneeCount++; }
     const avgKneeAngle = validKneeCount > 0 ? kneeSum / validKneeCount : 170;
+    const smoothedKnee = ema(this.smooth.kneeAngle, avgKneeAngle, 0.4);
+    this.smooth.kneeAngle = smoothedKnee;
 
+    const safeLeftKnee = leftKneeAngle != null ? leftKneeAngle : 170;
+    const safeRightKnee = rightKneeAngle != null ? rightKneeAngle : 170;
+
+    // Thigh deviation from vertical (0° = vertical standing leg)
+    const leftThighDev = calculateThighDeviation(LH, LK);
+    const rightThighDev = calculateThighDeviation(RH, RK);
+    const avgThighDev = (leftThighDev + rightThighDev) / 2;
+
+    // Temporal frame deltas & velocities
+    const dt = Math.max(0.016, (timestamp - (this.lastTimestamp ?? timestamp)) / 1000);
     const smoothedHipYNorm = ema(this.smooth.hipY, currentHipYNorm, 0.3);
     this.smooth.hipY = smoothedHipYNorm;
 
-    // Frame Time Delta
-    const dt = Math.max(0.016, (timestamp - (this.lastTimestamp ?? timestamp)) / 1000);
-    
-    // Vertical Velocity (positive = upward motion)
     if (this.prevHipYNorm != null) {
-      this.verticalVelocity = (this.prevHipYNorm - smoothedHipYNorm) / dt;
+      this.verticalVelocity = (this.prevHipYNorm - smoothedHipYNorm) / dt; // Positive = UPWARD movement
     }
     this.prevHipYNorm = smoothedHipYNorm;
-
-    // Horizontal Velocity (rate of side movement)
-    this.horizontalVelocity = Math.abs(smoothedVisualX - this.prevVisualX) / dt;
-    this.prevVisualX = smoothedVisualX;
-
     this.lastTimestamp = timestamp;
 
-    // ---------------------------------------------------------
-    // BASELINE CALIBRATION (Establishes player's natural standing reference)
-    // ---------------------------------------------------------
-    if (!this.calibrated || this.internalState === "CALIBRATING") {
-      this.internalState = "CALIBRATING";
-      this.calibrationFrames++;
-      
-      this.baseline.headYNorm = ema(this.baseline.headYNorm, currentHeadYNorm, 0.1);
-      this.baseline.hipYNorm = ema(this.baseline.hipYNorm, currentHipYNorm, 0.1);
-      this.baseline.ankleYNorm = ema(this.baseline.ankleYNorm, currentAnkleYNorm, 0.1);
-      this.baseline.kneeAngle = ema(this.baseline.kneeAngle, avgKneeAngle, 0.1);
-      this.baseline.legDistNorm = ema(this.baseline.legDistNorm, currentLegDistNorm, 0.1);
-      this.baseline.bodyHeightNorm = ema(this.baseline.bodyHeightNorm, currentBodyHeightNorm, 0.1);
-
-      if (this.calibrationFrames >= this.targetCalibrationFrames) {
-        this.calibrated = true;
-        this.internalState = "IDLE";
-      }
-
-      this.updateTelemetry(avgKneeAngle, leftKneeAngle ?? 170, rightKneeAngle ?? 170, 0, 0, 0, smoothedVisualX, 1, 0, 0, 0);
-      return { label: `CALIBRATING...`, state: "CALIBRATING", position: position };
-    }
-
-    // ---------------------------------------------------------
-    // VERTICAL PLAYER DISPLACEMENT METRICS
-    // ---------------------------------------------------------
-    this.headDeltaNorm = (this.baseline.headYNorm - currentHeadYNorm);
-    this.hipDeltaNorm = (this.baseline.hipYNorm - currentHipYNorm);
-
-    // ---------------------------------------------------------
-    // LOWER-BODY LEG MOTION VELOCITY (EXCLUDES HANDS/ARMS 100%)
-    // ---------------------------------------------------------
-    const leftAnkleVel = LA && this.prevLA ? dist(LA, this.prevLA) / (dt * scale) : 0;
-    const rightAnkleVel = RA && this.prevRA ? dist(RA, this.prevRA) / (dt * scale) : 0;
-    const leftKneeVel = LK && this.prevLK ? dist(LK, this.prevLK) / (dt * scale) : 0;
-    const rightKneeVel = RK && this.prevRK ? dist(RK, this.prevRK) / (dt * scale) : 0;
+    this.leftAnkleVel = LA && this.prevLA ? dist(LA, this.prevLA) / (dt * torsoLen) : 0;
+    this.rightAnkleVel = RA && this.prevRA ? dist(RA, this.prevRA) / (dt * torsoLen) : 0;
+    this.leftKneeVel = LK && this.prevLK ? dist(LK, this.prevLK) / (dt * torsoLen) : 0;
+    this.rightKneeVel = RK && this.prevRK ? dist(RK, this.prevRK) / (dt * torsoLen) : 0;
+    this.leftHipVel = LH && this.prevLH ? dist(LH, this.prevLH) / (dt * torsoLen) : 0;
+    this.rightHipVel = RH && this.prevRH ? dist(RH, this.prevRH) / (dt * torsoLen) : 0;
 
     this.prevLA = LA ? { x: LA.x, y: LA.y } : null;
     this.prevRA = RA ? { x: RA.x, y: RA.y } : null;
     this.prevLK = LK ? { x: LK.x, y: LK.y } : null;
     this.prevRK = RK ? { x: RK.x, y: RK.y } : null;
+    this.prevLH = LH ? { x: LH.x, y: LH.y } : null;
+    this.prevRH = RH ? { x: RH.x, y: RH.y } : null;
 
-    const avgLegMotionVel = (leftAnkleVel + rightAnkleVel + leftKneeVel + rightKneeVel) / 4;
-    this.avgLegMotionVel = avgLegMotionVel;
+    this.avgLegMotionVel = (this.leftAnkleVel + this.rightAnkleVel + this.leftKneeVel + this.rightKneeVel) / 4;
 
-    // ---------------------------------------------------------
-    // ROLLING TEMPORAL POSE SEQUENCE BUFFER UPDATE
-    // ---------------------------------------------------------
-    const poseSample = {
-      timestamp: timestamp,
-      headY: currentHeadYNorm,
-      hipY: currentHipYNorm,
-      kneeAngle: avgKneeAngle,
-      ankleYDiff: (LA && RA) ? (LA.y - RA.y) / scale : 0,
-      kneeYDiff: (LK && RK) ? (LK.y - RK.y) / scale : 0,
-      legMotionVel: avgLegMotionVel
-    };
-    this.poseBuffer.push(poseSample);
-    if (this.poseBuffer.length > this.bufferCapacity) {
-      this.poseBuffer.shift();
+    // ── CALIBRATION PHASE (1-2s baseline standing setup) ──
+    if (!this.calibrated) {
+      this.calibrationFrames++;
+      this.baseline.headYNorm = ema(this.baseline.headYNorm, currentHeadYNorm, 0.1);
+      this.baseline.hipYNorm = ema(this.baseline.hipYNorm, currentHipYNorm, 0.1);
+      this.baseline.ankleYNorm = ema(this.baseline.ankleYNorm, currentAnkleYNorm, 0.1);
+      this.baseline.kneeAngle = ema(this.baseline.kneeAngle, avgKneeAngle, 0.1);
+      this.baseline.thighDev = ema(this.baseline.thighDev, avgThighDev, 0.1);
+      this.baseline.hipToAnkleNorm = ema(this.baseline.hipToAnkleNorm, currentHipToAnkleNorm, 0.1);
+
+      if (this.calibrationFrames >= this.targetCalibrationFrames) {
+        this.calibrated = true;
+      }
+
+      this.updateTelemetry({ leftKneeAngle, rightKneeAngle, avgThighDev, currentHipYNorm, avgAnkleRise: 0, gaitFlips: 0, inPhaseScore: 0, outOfPhaseScore: 0 });
+      return { label: "CALIBRATING...", state: "CALIBRATING", position: this.position };
     }
 
-    // ---------------------------------------------------------
-    // TEMPORAL ACTION PATTERN ANALYSIS OVER POSE BUFFER
-    // ---------------------------------------------------------
-    // A. Count lower-body leg alternation gait flips across time window
+    // ── Baseline relative displacement metrics ──
+    const ankleRiseLeft = LA ? (this.baseline.ankleYNorm - LA.y / torsoLen) : 0;
+    const ankleRiseRight = RA ? (this.baseline.ankleYNorm - RA.y / torsoLen) : 0;
+    let avgAnkleRise = 0, ankleCount = 0;
+    if (LA) { avgAnkleRise += ankleRiseLeft; ankleCount++; }
+    if (RA) { avgAnkleRise += ankleRiseRight; ankleCount++; }
+    if (ankleCount > 0) avgAnkleRise /= ankleCount;
+
+    const hipDeltaNorm = this.baseline.hipYNorm - currentHipYNorm; // Positive = Hips UP
+    const thighDevIncrease = avgThighDev - (this.baseline.thighDev ?? 8);
+
+    // Update rolling pose buffer for temporal leg phase analysis
+    const poseSample = {
+      timestamp,
+      leftAnkleY: LA ? LA.y / torsoLen : null,
+      rightAnkleY: RA ? RA.y / torsoLen : null,
+      ankleYDiff: (LA && RA) ? (LA.y - RA.y) / torsoLen : 0,
+      kneeYDiff: (LK && RK) ? (LK.y - RK.y) / torsoLen : 0,
+      legVel: this.avgLegMotionVel,
+    };
+    this.poseBuffer.push(poseSample);
+    if (this.poseBuffer.length > this.bufferCapacity) this.poseBuffer.shift();
+
+    // Gait alternation flips for running
     let gaitFlips = 0;
+    const thresh = CONFIG.GAIT_FLIP_THRESHOLD;
     for (let i = 1; i < this.poseBuffer.length; i++) {
-      const prevDiff = this.poseBuffer[i - 1].ankleYDiff;
-      const currDiff = this.poseBuffer[i].ankleYDiff;
-      if ((prevDiff > 0.04 && currDiff < -0.04) || (prevDiff < -0.04 && currDiff > 0.04)) {
+      const prev = this.poseBuffer[i - 1].ankleYDiff;
+      const curr = this.poseBuffer[i].ankleYDiff;
+      if ((prev > thresh && curr < -thresh) || (prev < -thresh && curr > thresh)) {
         gaitFlips++;
       }
     }
-    const hasSustainedLegGait = gaitFlips >= 2 && avgLegMotionVel >= CONFIG.MOVEMENT_DEADZONE;
 
-    // B. Analyze vertical trajectory sequence over temporal buffer for ballistic jumps
-    const minHipY = Math.min(...this.poseBuffer.map(f => f.hipY));
-    const maxHipRiseInWindow = this.baseline.hipYNorm - minHipY;
+    const recentVelFrames = Math.min(this.poseBuffer.length, 10);
+    let recentLegVelSum = 0;
+    for (let i = this.poseBuffer.length - recentVelFrames; i < this.poseBuffer.length; i++) {
+      recentLegVelSum += this.poseBuffer[i].legVel;
+    }
+    const avgRecentLegVel = recentVelFrames > 0 ? recentLegVelSum / recentVelFrames : 0;
 
-    // ---------------------------------------------------------
-    // GROUND BASELINE & ANKLE ELEVATION METRICS
-    // ---------------------------------------------------------
-    const ankleRiseLeft = LA ? (this.baseline.ankleYNorm - LA.y / scale) : 0;
-    const ankleRiseRight = RA ? (this.baseline.ankleYNorm - RA.y / scale) : 0;
-    
-    let validAnkleCount = 0;
-    let ankleRiseSum = 0;
-    if (LA) { ankleRiseSum += ankleRiseLeft; validAnkleCount++; }
-    if (RA) { ankleRiseSum += ankleRiseRight; validAnkleCount++; }
-    const avgAnkleRise = validAnkleCount > 0 ? ankleRiseSum / validAnkleCount : 0;
+    // ── LEG PHASE SYNCHRONIZATION ANALYSIS ──
+    const legPhase = this.calculateLegPhaseRelationship();
+    const isInPhase = legPhase.inPhaseScore > 0.55; // Bilateral coordinated movement (JUMPING)
+    const isOutOfPhase = legPhase.outOfPhaseScore > 0.40 || gaitFlips >= 1; // Alternating gait cycles (RUNNING)
 
-    const feetGrounded = avgAnkleRise < 0.14;
-    const feetAirborne = avgAnkleRise > 0.15 || (ankleRiseLeft > 0.11 && ankleRiseRight > 0.11);
+    // ════════════════════════════════════════════════════════════
+    //  JUMP INTERNAL STATE MACHINE (Multi-signal: in-phase vertical rise + airborne event)
+    // ════════════════════════════════════════════════════════════
+    const feetAirborne = (avgAnkleRise > 0.05) || (ankleRiseLeft > 0.04 && ankleRiseRight > 0.04);
+    const bodyRising = this.verticalVelocity > 0.25 || hipDeltaNorm > 0.04;
 
-    // ---------------------------------------------------------
-    // CONFIDENCE SCORE & ACTION PATTERN EVALUATIONS
-    // ---------------------------------------------------------
-    
-    // 1. IDLE CONFIDENCE: Upright stance, extended knees (>135 deg), grounded feet
-    const isUprightStance = avgKneeAngle > 135 && this.hipDeltaNorm > -0.06 && feetGrounded;
-    const rawIdleConfidence = isUprightStance ? 0.95 : 0.20;
-    this.conf.idle = ema(this.smooth.idle, rawIdleConfidence, 0.35);
-    this.smooth.idle = this.conf.idle;
+    if (this.jumpEventState === "GROUND") {
+      if (bodyRising && (isInPhase || !isOutOfPhase) && avgKneeAngle > 140) {
+        this.jumpEventState = "TAKEOFF_CANDIDATE";
+      }
+    } else if (this.jumpEventState === "TAKEOFF_CANDIDATE") {
+      if (feetAirborne || hipDeltaNorm > 0.06) {
+        this.jumpEventState = "AIRBORNE";
+      } else if (this.verticalVelocity < -0.1 || isOutOfPhase) {
+        this.jumpEventState = "GROUND"; // Cancel candidate if legs alternate (running) or velocity reverses
+      }
+    } else if (this.jumpEventState === "AIRBORNE") {
+      if ((!feetAirborne && hipDeltaNorm < 0.03) || this.verticalVelocity < -0.15) {
+        this.jumpEventState = "LANDING";
+      }
+    } else if (this.jumpEventState === "LANDING") {
+      if (!feetAirborne && Math.abs(this.verticalVelocity) < 0.10) {
+        this.jumpEventState = "GROUND";
+      }
+    }
 
-    // 2. SQUATTING CONFIDENCE: Head/hips significantly BELOW standing baseline + bent knees
-    // POSTURE-BASED & HYSTERESIS STABLE: Holds state while squatting even if completely still!
-    const kneeFlexion = Math.max(0, this.baseline.kneeAngle - avgKneeAngle);
-    const kneeFlexionScore = clamp(kneeFlexion / 20, 0, 1); // 20 deg drop gives full score
-    const headDropScore = clamp(Math.max(0, -this.headDeltaNorm) / 0.10, 0, 1);
-    const hipDropScore = clamp(Math.max(0, -this.hipDeltaNorm) / 0.10, 0, 1);
+    // ════════════════════════════════════════════════════════════
+    //  ACTION CONFIDENCE EVALUATION (0 - 100%)
+    // ════════════════════════════════════════════════════════════
 
-    const rawSquatConfidence = headDropScore * 0.40 + hipDropScore * 0.35 + kneeFlexionScore * 0.25;
-    this.conf.squat = ema(this.smooth.squat, rawSquatConfidence, 0.35);
-    this.smooth.squat = this.conf.squat;
+    // 1. SQUATTING CONFIDENCE (Lower body posture)
+    let squatConf = 0;
+    const avgKnee = (safeLeftKnee + safeRightKnee) / 2;
+    const isBentPose = safeLeftKnee < CONFIG.SQUAT_KNEE_ENTER && safeRightKnee < CONFIG.SQUAT_KNEE_ENTER;
+    const isSquatHolding = this.visibleAction === "SQUATTING" && safeLeftKnee < CONFIG.SQUAT_KNEE_EXIT && safeRightKnee < CONFIG.SQUAT_KNEE_EXIT;
 
-    // 3. RUNNING CONFIDENCE: Sustained temporal leg alternation gait (NON-SQUATTING)
-    let rawRunningConfidence = 0;
-    
-    if (this.jumpCooldownFrames > 0) {
-      this.jumpCooldownFrames--;
-      rawRunningConfidence = 0;
-    } else if (this.conf.squat >= 0.40 || this.squatFrames > 0 || this.headDeltaNorm < CONFIG.SQUAT_EXIT_DELTA) {
-      rawRunningConfidence = 0; // Squat posture strictly blocks running!
-    } else if (hasSustainedLegGait) {
-      const motionScore = clamp((avgLegMotionVel - CONFIG.MOVEMENT_DEADZONE) / 0.55, 0, 1);
-      const gaitFlipScore = clamp(gaitFlips / 3, 0, 1);
-      const velAsymmetry = Math.abs(leftAnkleVel - rightAnkleVel);
-      const velAsymmetryScore = clamp(velAsymmetry / 0.40, 0, 1);
-
-      rawRunningConfidence = motionScore * 0.40 + gaitFlipScore * 0.40 + velAsymmetryScore * 0.20;
+    if (isBentPose || isSquatHolding) {
+      squatConf = Math.min(100, Math.max(85, Math.round(((160 - avgKnee) / 55) * 100)));
+      if (thighDevIncrease > CONFIG.SQUAT_THIGH_DEV_MIN) squatConf = 100;
+    } else if (avgKnee < 155) {
+      squatConf = Math.round(((160 - avgKnee) / 55) * 80);
     } else {
-      rawRunningConfidence = 0;
+      squatConf = 0;
     }
 
-    // Standing still / arm-only motion guard
-    if (avgLegMotionVel < (CONFIG.MOVEMENT_DEADZONE * 1.3)) {
-      rawRunningConfidence = 0;
+    // 2. JUMPING CONFIDENCE (Bilateral in-phase coordinated event)
+    let jumpConf = 0;
+    if (this.jumpEventState === "AIRBORNE") {
+      jumpConf = 95;
+    } else if (this.jumpEventState === "TAKEOFF_CANDIDATE" && (isInPhase || bodyRising)) {
+      jumpConf = 80;
     }
 
-    this.conf.running = ema(this.smooth.running, rawRunningConfidence, 0.35);
-    this.smooth.running = this.conf.running;
-
-    // 4. JUMP CONFIDENCE: Airborne feet elevation & vertical upward acceleration
-    // ARMS/HANDS IGNORED 100%: Evaluates vertical trajectory & foot elevation!
-    const headRiseScore = clamp(Math.max(0, this.headDeltaNorm) / 0.08, 0, 1);
-    const upwardVelScore = clamp(this.verticalVelocity / 0.45, 0, 1);
-
-    const rawJumpConfidence = feetAirborne 
-      ? (clamp(avgAnkleRise / 0.15, 0, 1) * 0.65 + Math.max(0, upwardVelScore) * 0.35)
-      : (this.verticalVelocity > 0.60 && avgAnkleRise > 0.10 ? 0.60 : 0.0);
-
-    this.conf.jump = ema(this.smooth.jump, rawJumpConfidence, 0.35);
-    this.smooth.jump = this.conf.jump;
-
-    // Dynamic Baseline Refinement: Refines standing baseline ONLY when in stable IDLE stance
-    if (this.visibleState === "IDLE" && Math.abs(this.verticalVelocity) < 0.15 && isUprightStance) {
-      this.baseline.headYNorm = ema(this.baseline.headYNorm, currentHeadYNorm, 0.005);
-      this.baseline.hipYNorm = ema(this.baseline.hipYNorm, currentHipYNorm, 0.005);
-      this.baseline.kneeAngle = ema(this.baseline.kneeAngle, avgKneeAngle, 0.005);
-      this.baseline.ankleYNorm = ema(this.baseline.ankleYNorm, currentAnkleYNorm, 0.005);
-      this.baseline.legDistNorm = ema(this.baseline.legDistNorm, currentLegDistNorm, 0.005);
+    // CRITICAL SUPPRESSION: Running out-of-phase leg alternation or squatting FORCES jumpConf = 0
+    if (isOutOfPhase || squatConf > 40) {
+      jumpConf = 0;
     }
 
-    // ---------------------------------------------------------
-    // TEMPORAL DEBOUNCING & HYSTERESIS COUNTERS
-    // ---------------------------------------------------------
-    if (this.conf.jump >= CONFIG.JUMP_THRESHOLD && feetAirborne) {
-      this.airborneFrames = clamp(this.airborneFrames + 2, 0, 10);
+    // 3. RUNNING CONFIDENCE (Out-of-phase leg alternation + repeated gait cycles)
+    let runConf = 0;
+    if (squatConf > 30 || isSquatHolding || avgKnee < 150) {
+      runConf = 0; // Squat posture suppresses false running!
+    } else if (jumpConf > 50 || isInPhase) {
+      runConf = 0; // Coordinated jump event suppresses running!
+    } else {
+      if (gaitFlips >= CONFIG.GAIT_FLIPS_REQUIRED && avgRecentLegVel >= CONFIG.RUNNING_LEG_VEL_MIN) {
+        runConf = Math.min(100, 60 + gaitFlips * 15 + Math.round(avgRecentLegVel * 100));
+      } else if (gaitFlips >= 1 || (isOutOfPhase && avgRecentLegVel > 0.08)) {
+        runConf = 40; // Internal candidate score during running startup
+      }
+    }
+
+    // 4. IDLE CONFIDENCE (Default upright stance with extended knees)
+    let idleConf = 0;
+    if (avgKnee > 155 && jumpConf < 30 && squatConf < 30 && runConf < 30) {
+      idleConf = Math.min(100, Math.round(((avgKnee - 140) / 40) * 100));
+    } else {
+      idleConf = Math.max(0, 100 - Math.max(squatConf, jumpConf, runConf));
+    }
+
+    this.confidence = {
+      idle: Math.round(idleConf),
+      squat: Math.round(squatConf),
+      jump: Math.round(jumpConf),
+      run: Math.round(runConf)
+    };
+
+    // ════════════════════════════════════════════════════════════
+    //  CANDIDATE ACTION RESOLUTION & STABLE HYSTERESIS
+    // ════════════════════════════════════════════════════════════
+    if (this.jumpCooldownFrames > 0) this.jumpCooldownFrames--;
+
+    // Determine internal candidate action based on confidence scores
+    if (jumpConf >= 75 && this.jumpCooldownFrames === 0) {
+      this.candidateAction = "JUMPING";
+    } else if (squatConf >= 60) {
+      this.candidateAction = "SQUATTING";
+    } else if (runConf >= 55) {
+      this.candidateAction = "RUNNING";
+    } else {
+      this.candidateAction = "IDLE";
+    }
+
+    // Debouncing counter updates
+    if (this.candidateAction === "JUMPING") {
+      this.airborneFrames = Math.min(this.airborneFrames + 2, 10);
     } else {
       this.airborneFrames = Math.max(0, this.airborneFrames - 1);
     }
 
-    if ((this.conf.squat >= CONFIG.SQUAT_THRESHOLD || this.headDeltaNorm < CONFIG.SQUAT_ENTER_DELTA) && this.airborneFrames === 0) {
-      this.squatFrames = clamp(this.squatFrames + 2, 0, 10);
-      this.idleFrames = 0;
+    if (this.candidateAction === "SQUATTING" && this.airborneFrames === 0) {
+      this.squatFrames = Math.min(this.squatFrames + 1, 15);
       this.runningFrames = 0;
-    } else if (this.headDeltaNorm < CONFIG.SQUAT_EXIT_DELTA && this.visibleState === "SQUATTING") {
-      this.squatFrames = Math.max(CONFIG.STATE_CONFIRMATION_FRAMES, this.squatFrames);
     } else {
       this.squatFrames = Math.max(0, this.squatFrames - 1);
     }
 
-    if (this.conf.running >= CONFIG.RUNNING_THRESHOLD && this.airborneFrames === 0 && this.squatFrames === 0 && feetGrounded && this.jumpCooldownFrames === 0) {
-      this.runningFrames = clamp(this.runningFrames + 2, 0, 10);
+    if (this.candidateAction === "RUNNING" && this.airborneFrames === 0 && this.squatFrames === 0 && this.jumpCooldownFrames === 0) {
+      this.runningFrames = Math.min(this.runningFrames + 1, 15);
     } else {
       this.runningFrames = Math.max(0, this.runningFrames - 1);
     }
 
-    // ---------------------------------------------------------
-    // HIERARCHICAL VISIBLE STATE SELECTION (STRICT 12 VISIBLE STATES)
-    // Default Stance is IDLE unless active JUMPING, SQUATTING, or RUNNING confirmed!
-    // Priority:
-    // 1. JUMPING  (Airborne feet elevation confirmed)
-    // 2. SQUATTING (Lower-body squat posture confirmed)
-    // 3. RUNNING  (Sustained lower-body leg motion pattern confirmed)
-    // 4. IDLE     (Default Standing Posture)
-    // ---------------------------------------------------------
+    // ── STABLE VISIBLE ACTION TRANSITION (NO FLICKER ON RUNNING STARTUP) ──
+    const prevAction = this.visibleAction;
+    let confirmedTarget = prevAction;
+
     if (this.airborneFrames >= CONFIG.JUMP_CONFIRMATION_FRAMES) {
-      this.visibleState = "JUMPING";
-      this.jumpCooldownFrames = 15;
-    } else if (this.squatFrames >= CONFIG.STATE_CONFIRMATION_FRAMES && this.jumpCooldownFrames === 0) {
-      this.visibleState = "SQUATTING";
-    } else if (this.runningFrames >= CONFIG.RUNNING_CONFIRMATION_FRAMES && this.jumpCooldownFrames === 0) {
-      this.visibleState = "RUNNING";
-    } else {
-      this.visibleState = "IDLE"; // DEFAULT UPRIGHT STANDING STANCE
+      confirmedTarget = "JUMPING";
+      this.jumpCooldownFrames = CONFIG.JUMP_COOLDOWN;
+    } else if (this.squatFrames >= CONFIG.SQUAT_CONFIRMATION_FRAMES) {
+      confirmedTarget = "SQUATTING";
+    } else if (this.runningFrames >= CONFIG.RUNNING_CONFIRMATION_FRAMES) {
+      confirmedTarget = "RUNNING";
+    } else if (this.squatFrames === 0 && this.airborneFrames === 0 && this.runningFrames === 0) {
+      confirmedTarget = "IDLE";
     }
 
-    const formattedLabel = `${this.visibleState} ${position}`;
+    // Apply hold persistence
+    if (confirmedTarget !== prevAction) {
+      if (this.stateHoldCounter < CONFIG.STATE_HOLD_FRAMES && prevAction !== "IDLE") {
+        this.visibleAction = prevAction;
+      } else {
+        this.visibleAction = confirmedTarget;
+        this.stateHoldCounter = 0;
+      }
+    } else {
+      this.visibleAction = confirmedTarget;
+    }
+    this.stateHoldCounter++;
 
-    this.updateTelemetry(avgKneeAngle, leftKneeAngle ?? 170, rightKneeAngle ?? 170, -this.hipDeltaNorm, avgAnkleRise, this.verticalVelocity, smoothedVisualX, this.conf.idle, this.conf.squat, this.conf.running, this.conf.jump);
+    // Baseline drift correction during stable standing IDLE
+    const isStableStanding = this.visibleAction === "IDLE" &&
+      Math.abs(this.verticalVelocity) < 0.08 &&
+      avgKnee > 155 &&
+      this.avgLegMotionVel < 0.04;
+    if (isStableStanding) {
+      this.baseline.headYNorm = ema(this.baseline.headYNorm, currentHeadYNorm, 0.002);
+      this.baseline.hipYNorm = ema(this.baseline.hipYNorm, currentHipYNorm, 0.002);
+      this.baseline.ankleYNorm = ema(this.baseline.ankleYNorm, currentAnkleYNorm, 0.002);
+      this.baseline.kneeAngle = ema(this.baseline.kneeAngle, avgKneeAngle, 0.002);
+      this.baseline.thighDev = ema(this.baseline.thighDev, avgThighDev, 0.002);
+      this.baseline.hipToAnkleNorm = ema(this.baseline.hipToAnkleNorm, currentHipToAnkleNorm, 0.002);
+    }
 
-    return { label: formattedLabel, state: this.visibleState, position: position };
+    this.updateTelemetry({
+      leftKneeAngle,
+      rightKneeAngle,
+      avgKneeAngle: smoothedKnee,
+      avgThighDev,
+      currentHipYNorm,
+      leftLegVel: this.leftAnkleVel,
+      rightLegVel: this.rightAnkleVel,
+      avgAnkleRise,
+      gaitFlips,
+      inPhaseScore: legPhase.inPhaseScore,
+      outOfPhaseScore: legPhase.outOfPhaseScore
+    });
+
+    // Format label strictly as "ACTION — POSITION" matching the 12 final states
+    const formattedLabel = `${this.visibleAction} — ${this.position}`;
+    return { label: formattedLabel, action: this.visibleAction, state: this.visibleAction, position: this.position };
   }
 
-  classifyPosition(visualX) {
-    if (visualX < 0.33) return "LEFT";
-    if (visualX > 0.67) return "RIGHT";
-    return "CENTER";
-  }
-
-  updateTelemetry(avgKnee, lKnee, rKnee, hipDrop, ankleRise, velocity, visualX, cIdle, cSquat, cRun, cJump) {
+  updateTelemetry(d) {
     this.telemetry = {
-      state: `${this.visibleState} (${this.position})`,
+      visibleAction: this.visibleAction,
+      candidateAction: this.candidateAction,
       position: this.position,
-      calibrated: this.calibrated ? `Ready (100%)` : `Calibrating (${Math.round((this.calibrationFrames/this.targetCalibrationFrames)*100)}%)`,
-      confidences: `IDLE: ${(cIdle*100).toFixed(0)}% | SQUAT: ${(cSquat*100).toFixed(0)}% | RUN: ${(cRun*100).toFixed(0)}% | JUMP: ${(cJump*100).toFixed(0)}%`,
-      headDelta: (this.headDeltaNorm >= 0 ? "+" : "") + this.headDeltaNorm.toFixed(2),
-      legMotionVel: this.avgLegMotionVel.toFixed(2),
-      leftKnee: Math.round(lKnee),
-      rightKnee: Math.round(rKnee),
-      avgKnee: Math.round(avgKnee),
-      baselineKnee: Math.round(this.baseline.kneeAngle),
-      hipDrop: hipDrop.toFixed(2),
-      ankleRise: ankleRise.toFixed(2),
-      velocity: (velocity >= 0 ? "+" : "") + velocity.toFixed(2),
-      visualX: visualX.toFixed(2),
-      debounce: `Idle ${this.idleFrames} | Squat ${this.squatFrames} | Run ${this.runningFrames} | Air ${this.airborneFrames} | Cooldown ${this.jumpCooldownFrames}`
+      calibrated: this.calibrated ? "Ready" : `Cal ${Math.round((this.calibrationFrames/this.targetCalibrationFrames)*100)}%`,
+      leftKneeAngle: d.leftKneeAngle != null ? Math.round(d.leftKneeAngle) : null,
+      rightKneeAngle: d.rightKneeAngle != null ? Math.round(d.rightKneeAngle) : null,
+      leftAnkleVel: this.leftAnkleVel.toFixed(2),
+      rightAnkleVel: this.rightAnkleVel.toFixed(2),
+      leftKneeVel: this.leftKneeVel.toFixed(2),
+      rightKneeVel: this.rightKneeVel.toFixed(2),
+      leftHipVel: this.leftHipVel.toFixed(2),
+      rightHipVel: this.rightHipVel.toFixed(2),
+      hipVertVel: this.verticalVelocity.toFixed(2),
+      inPhaseScore: Math.round((d.inPhaseScore ?? 0) * 100),
+      outOfPhaseScore: Math.round((d.outOfPhaseScore ?? 0) * 100),
+      cycleCount: d.gaitFlips ?? 0,
+      jumpEventState: this.jumpEventState,
+      persistenceFrames: this.stateHoldCounter,
+      confidence: this.confidence
     };
   }
 }
@@ -681,15 +775,29 @@ async function loop() {
 
       if (showDebug) {
         const t = classifier.telemetry;
+        const c = t.confidence || {};
+        const sScore = ((c.squat ?? 0) / 100).toFixed(2);
+        const jScore = ((c.jump ?? 0) / 100).toFixed(2);
+        const rScore = ((c.run ?? 0) / 100).toFixed(2);
+        const iScore = ((c.idle ?? 100) / 100).toFixed(2);
+        const altScore = ((t.outOfPhaseScore ?? 0) / 100).toFixed(2);
+
         debugEl.textContent = 
-          `State: ${t.state}\n` +
-          `Calibration: ${t.calibrated}\n` +
-          `Confidences: ${t.confidences}\n` +
-          `Head Delta: ${t.headDelta} | Leg Motion Speed: ${t.legMotionVel}\n` +
-          `Visual X (Screen): ${t.visualX}\n` +
-          `Left Knee: ${t.leftKnee}° | Right Knee: ${t.rightKnee}° | Avg: ${t.avgKnee}°\n` +
-          `Hip Drop: ${t.hipDrop} | Ankle Rise: ${t.ankleRise} | Vert Vel: ${t.velocity}\n` +
-          `Debounce: ${t.debounce}`;
+          `Action: ${t.visibleAction} (${t.position})\n\n` +
+          `Squat Score: ${sScore}\n` +
+          `Jump Score: ${jScore}\n` +
+          `Run Score: ${rScore}\n` +
+          `Idle Score: ${iScore}\n\n` +
+          `Left Knee Angle: ${t.leftKneeAngle ?? '?' }°\n` +
+          `Right Knee Angle: ${t.rightKneeAngle ?? '?'}°\n\n` +
+          `Left Ankle Velocity: ${t.leftAnkleVel}\n` +
+          `Right Ankle Velocity: ${t.rightAnkleVel}\n\n` +
+          `Left Knee Velocity: ${t.leftKneeVel}\n` +
+          `Right Knee Velocity: ${t.rightKneeVel}\n\n` +
+          `Hip Vertical Velocity: ${t.hipVertVel >= 0 ? '+' : ''}${t.hipVertVel}\n\n` +
+          `Left/Right Alternation Score: ${altScore}\n\n` +
+          `Detected Gait Cycles: ${t.cycleCount}\n\n` +
+          `Jump Event State: ${t.jumpEventState}`;
       }
     } else {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
