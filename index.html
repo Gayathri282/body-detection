@@ -125,7 +125,7 @@ const CONFIG = {
   SQUAT_THRESHOLD: 0.48,            // Squat score threshold to trigger SQUATTING
   STANDING_THRESHOLD: 0.25,         // Threshold to return to IDLE
   STATE_CONFIRMATION_FRAMES: 3,     // Debounce frames required for posture transitions
-  RUNNING_CONFIRMATION_FRAMES: 4,   // Debounce frames to confirm RUNNING
+  RUNNING_CONFIRMATION_FRAMES: 3,   // Debounce frames to confirm RUNNING
   JUMP_CONFIRMATION_FRAMES: 3       // Debounce frames to confirm JUMPING
 };
 
@@ -408,7 +408,7 @@ class BodyPoseClassifier {
 
     // Movement Evaluations (JUMPING & RUNNING)
     const isJumpingSignal = (feetAirborne || (this.verticalVelocity > 0.55 && avgAnkleRise > 0.12)) && !isSquattingSignal;
-    const isRunningSignal = runningScore > 0.45 && feetGrounded && !isSquattingSignal;
+    const isRunningSignal = runningScore > 0.38 && !isSquattingSignal;
 
     // Debounce updates
     if (isJumpingSignal) {
