@@ -420,16 +420,15 @@ class BodyPoseClassifier {
     // CONFIDENCE SCORE & ACTION PATTERN EVALUATIONS
     // ---------------------------------------------------------
     
-    // 1. IDLE CONFIDENCE: Head & hips within natural standing reference range
-    const kneeExtension = clamp((avgKneeAngle - 130) / (Math.max(140, this.baseline.kneeAngle) - 130), 0, 1);
-    const headStandingRange = 1 - clamp(Math.abs(this.headDeltaNorm) / 0.18, 0, 1);
-    const hipStandingRange = 1 - clamp(Math.abs(this.hipDeltaNorm) / 0.18, 0, 1);
-    
-    const rawIdleConfidence = kneeExtension * 0.40 + headStandingRange * 0.35 + hipStandingRange * 0.25;
+    // 1. IDLE CONFIDENCE: Upright stance, extended knees (>135 deg), grounded feet
+    const feetGrounded = avgAnkleRise < 0.14;
+    const isUprightStance = avgKneeAngle > 135 && this.hipDeltaNorm > -0.06 && feetGrounded;
+    const rawIdleConfidence = isUprightStance ? 0.95 : 0.20;
     this.conf.idle = ema(this.smooth.idle, rawIdleConfidence, 0.35);
     this.smooth.idle = this.conf.idle;
 
     // 2. SQUATTING CONFIDENCE: Head/hips significantly BELOW standing baseline + bent knees
+    // POSTURE-BASED & HYSTERESIS STABLE: Holds state while squatting even if completely still!
     const kneeFlexion = Math.max(0, this.baseline.kneeAngle - avgKneeAngle);
     const kneeFlexionScore = clamp(kneeFlexion / 20, 0, 1); // 20 deg drop gives full score
     const headDropScore = clamp(Math.max(0, -this.headDeltaNorm) / 0.10, 0, 1);
@@ -459,37 +458,28 @@ class BodyPoseClassifier {
     }
 
     // Standing still / arm-only motion guard
-    if (this.conf.idle > 0.65 && avgLegMotionVel < (CONFIG.MOVEMENT_DEADZONE * 1.4)) {
+    if (avgLegMotionVel < (CONFIG.MOVEMENT_DEADZONE * 1.3)) {
       rawRunningConfidence = 0;
     }
 
     this.conf.running = ema(this.smooth.running, rawRunningConfidence, 0.35);
     this.smooth.running = this.conf.running;
 
-    // 4. JUMP CONFIDENCE: Head/hips ABOVE standing baseline + airborne feet elevation
-    const ankleRiseLeft = LA ? (this.baseline.ankleYNorm - LA.y / scale) : 0;
-    const ankleRiseRight = RA ? (this.baseline.ankleYNorm - RA.y / scale) : 0;
-    
-    let validAnkleCount = 0;
-    let ankleRiseSum = 0;
-    if (LA) { ankleRiseSum += ankleRiseLeft; validAnkleCount++; }
-    if (RA) { ankleRiseSum += ankleRiseRight; validAnkleCount++; }
-    const avgAnkleRise = validAnkleCount > 0 ? ankleRiseSum / validAnkleCount : 0;
-
-    const feetGrounded = avgAnkleRise < 0.12;
-    const feetAirborne = avgAnkleRise > 0.14 || (ankleRiseLeft > 0.10 && ankleRiseRight > 0.10);
+    // 4. JUMP CONFIDENCE: Airborne feet elevation & vertical upward acceleration
+    // ARMS/HANDS IGNORED 100%: Evaluates vertical trajectory & foot elevation!
+    const feetAirborne = avgAnkleRise > 0.15 || (ankleRiseLeft > 0.11 && ankleRiseRight > 0.11);
     const headRiseScore = clamp(Math.max(0, this.headDeltaNorm) / 0.08, 0, 1);
     const upwardVelScore = clamp(this.verticalVelocity / 0.45, 0, 1);
 
-    const rawJumpConfidence = (feetAirborne || headRiseScore > 0.6 || maxHipRiseInWindow > 0.14)
-      ? (headRiseScore * 0.40 + clamp(avgAnkleRise / 0.14, 0, 1) * 0.35 + Math.max(0, upwardVelScore) * 0.25)
-      : (this.verticalVelocity > 0.55 && avgAnkleRise > 0.08 ? 0.60 : 0.0);
+    const rawJumpConfidence = feetAirborne 
+      ? (clamp(avgAnkleRise / 0.15, 0, 1) * 0.65 + Math.max(0, upwardVelScore) * 0.35)
+      : (this.verticalVelocity > 0.60 && avgAnkleRise > 0.10 ? 0.60 : 0.0);
 
     this.conf.jump = ema(this.smooth.jump, rawJumpConfidence, 0.35);
     this.smooth.jump = this.conf.jump;
 
-    // Dynamic Baseline Refinement
-    if (this.visibleState === "IDLE" && Math.abs(this.verticalVelocity) < 0.15 && this.conf.idle > 0.85 && this.conf.squat < 0.25 && feetGrounded) {
+    // Dynamic Baseline Refinement: Refines standing baseline ONLY when in stable IDLE stance
+    if (this.visibleState === "IDLE" && Math.abs(this.verticalVelocity) < 0.15 && isUprightStance) {
       this.baseline.headYNorm = ema(this.baseline.headYNorm, currentHeadYNorm, 0.005);
       this.baseline.hipYNorm = ema(this.baseline.hipYNorm, currentHipYNorm, 0.005);
       this.baseline.kneeAngle = ema(this.baseline.kneeAngle, avgKneeAngle, 0.005);
@@ -500,7 +490,7 @@ class BodyPoseClassifier {
     // ---------------------------------------------------------
     // TEMPORAL DEBOUNCING & HYSTERESIS COUNTERS
     // ---------------------------------------------------------
-    if (this.conf.jump >= CONFIG.JUMP_THRESHOLD || this.headDeltaNorm >= CONFIG.JUMP_ENTER_DELTA) {
+    if (this.conf.jump >= CONFIG.JUMP_THRESHOLD && feetAirborne) {
       this.airborneFrames = clamp(this.airborneFrames + 2, 0, 10);
     } else {
       this.airborneFrames = Math.max(0, this.airborneFrames - 1);
@@ -522,14 +512,14 @@ class BodyPoseClassifier {
       this.runningFrames = Math.max(0, this.runningFrames - 1);
     }
 
-    if (this.conf.idle >= CONFIG.IDLE_THRESHOLD && this.squatFrames === 0 && this.runningFrames === 0) {
-      this.idleFrames = clamp(this.idleFrames + 1, 0, 10);
-    } else {
-      this.idleFrames = Math.max(0, this.idleFrames - 1);
-    }
-
     // ---------------------------------------------------------
-    // HIERARCHICAL VISIBLE STATE SELECTION
+    // HIERARCHICAL VISIBLE STATE SELECTION (STRICT 12 VISIBLE STATES)
+    // Default Stance is IDLE unless active JUMPING, SQUATTING, or RUNNING confirmed!
+    // Priority:
+    // 1. JUMPING  (Airborne feet elevation confirmed)
+    // 2. SQUATTING (Lower-body squat posture confirmed)
+    // 3. RUNNING  (Sustained lower-body leg motion pattern confirmed)
+    // 4. IDLE     (Default Standing Posture)
     // ---------------------------------------------------------
     if (this.airborneFrames >= CONFIG.JUMP_CONFIRMATION_FRAMES) {
       this.visibleState = "JUMPING";
@@ -538,10 +528,8 @@ class BodyPoseClassifier {
       this.visibleState = "SQUATTING";
     } else if (this.runningFrames >= CONFIG.RUNNING_CONFIRMATION_FRAMES && this.jumpCooldownFrames === 0) {
       this.visibleState = "RUNNING";
-    } else if (this.idleFrames >= CONFIG.STATE_CONFIRMATION_FRAMES) {
-      this.visibleState = "IDLE";
     } else {
-      this.visibleState = this.visibleState || "IDLE";
+      this.visibleState = "IDLE"; // DEFAULT UPRIGHT STANDING STANCE
     }
 
     const formattedLabel = `${this.visibleState} ${position}`;
