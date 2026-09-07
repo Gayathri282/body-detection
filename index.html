@@ -14,7 +14,7 @@ body{display:flex;align-items:center;justify-content:center}
 /* Main Pose State Banner */
 #state{
   position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
-  text-align:center;font-weight:900;font-size:clamp(36px,6.5vw,96px);
+  text-align:center;font-weight:900;font-size:clamp(32px,6vw,90px);
   letter-spacing:.05em;pointer-events:none;text-transform:uppercase;
   text-shadow:0 0 30px rgba(0,229,255,0.25);
   transition:all .2s ease-out;
@@ -68,7 +68,7 @@ video,canvas{position:absolute;width:100%;height:100%;object-fit:cover;transform
   white-space:pre-line;z-index:10;background:rgba(10,12,18,0.85);
   backdrop-filter:blur(10px);padding:12px 16px;border-radius:10px;
   border:1px solid rgba(0,229,255,0.2);display:none;
-  max-width:350px;box-shadow:0 8px 24px rgba(0,0,0,0.5);
+  max-width:360px;box-shadow:0 8px 24px rgba(0,0,0,0.5);
 }
 #debug.active{display:block}
 </style>
@@ -76,7 +76,7 @@ video,canvas{position:absolute;width:100%;height:100%;object-fit:cover;transform
 <body>
 <div id="app">
   <div id="status">Camera: off · Pose model: loading…</div>
-  <div id="hint">LEFT · CENTER · RIGHT<br>IDLE · JUMPING · SQUATTING</div>
+  <div id="hint">LEFT · CENTER · RIGHT<br>IDLE · STANDING UP · SQUATTING · JUMPING · RUNNING</div>
   <div id="state">CAMERA OFF</div>
   
   <div id="camBox">
@@ -97,7 +97,7 @@ video,canvas{position:absolute;width:100%;height:100%;object-fit:cover;transform
 <script type="module">
 import { PoseLandmarker, FilesetResolver, DrawingUtils } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/+esm";
 
-// Catch & suppress browser extension message port errors
+// Suppress browser extension message port errors
 window.addEventListener("unhandledrejection", (event) => {
   if (event.reason && event.reason.message && event.reason.message.includes("message channel closed")) {
     event.preventDefault();
@@ -117,6 +117,18 @@ const toggleDebugBtn = document.getElementById("toggleDebug");
 
 let stream = null, landmarker = null, running = false, lastVideoTime = -1;
 let showDebug = false;
+
+// -------------------------------------------------------------
+// SYSTEM CONFIGURATION & PARAMETERS
+// -------------------------------------------------------------
+const CONFIG = {
+  SQUAT_THRESHOLD: 0.50,            // Squat score threshold to trigger SQUATTING
+  STANDING_THRESHOLD: 0.15,         // Max squat score to be considered fully STANDING / IDLE
+  STANDING_UP_THRESHOLD: 0.42,      // Threshold boundary for STANDING UP transition
+  STATE_CONFIRMATION_FRAMES: 4,     // Debounce frames required for posture transitions
+  RUNNING_CONFIRMATION_FRAMES: 4,   // Debounce frames to confirm RUNNING
+  JUMP_CONFIRMATION_FRAMES: 3       // Debounce frames to confirm JUMPING
+};
 
 // -------------------------------------------------------------
 // MATH & SKELETON GEOMETRY UTILITIES
@@ -163,8 +175,8 @@ class BodyPoseClassifier {
   }
 
   reset() {
-    this.internalState = "UNKNOWN"; // Internal: UNKNOWN, CALIBRATING, IDLE, SQUATTING, RECOVERING, TAKEOFF_CHECK, JUMPING, LANDING
-    this.visibleState = "IDLE"; // Visible: IDLE, SQUATTING, JUMPING
+    this.internalState = "UNKNOWN"; // Internal: UNKNOWN, CALIBRATING, IDLE, SQUATTING, STANDING_UP, JUMPING, RUNNING
+    this.visibleState = "IDLE"; // Visible: IDLE, STANDING UP, SQUATTING, JUMPING, RUNNING
     this.position = "CENTER"; // LEFT, CENTER, RIGHT
     this.calibrated = false;
     this.calibrationFrames = 0;
@@ -180,17 +192,23 @@ class BodyPoseClassifier {
     };
 
     // Temporal tracking buffers & smoothing
-    this.smooth = { visualX: null, hipY: null, squatScore: null };
+    this.smooth = { visualX: null, hipY: null, squatScore: null, runningScore: null };
     this.lastTimestamp = null;
     this.prevHipYNorm = null;
     this.prevHipDrop = 0;
     this.prevKneeAngle = 170;
+    this.prevVisualX = 0.5;
+    this.prevLeftKneeAngle = 170;
+    this.prevRightKneeAngle = 170;
     this.verticalVelocity = 0;
+    this.horizontalVelocity = 0;
     
     // Debounce & State Machine Counters
     this.squatDebounce = 0;
+    this.standingUpDebounce = 0;
     this.idleDebounce = 0;
     this.airborneFrames = 0;
+    this.runningFrames = 0;
     this.missingPersonFrames = 0;
     
     // Raw telemetry for debug overlay
@@ -280,12 +298,19 @@ class BodyPoseClassifier {
     const smoothedHipYNorm = ema(this.smooth.hipY, currentHipYNorm, 0.3);
     this.smooth.hipY = smoothedHipYNorm;
 
-    // Vertical Velocity (positive = upward motion)
+    // Frame Time Delta
     const dt = Math.max(0.016, (timestamp - (this.lastTimestamp ?? timestamp)) / 1000);
+    
+    // Vertical Velocity (positive = upward motion)
     if (this.prevHipYNorm != null) {
       this.verticalVelocity = (this.prevHipYNorm - smoothedHipYNorm) / dt;
     }
     this.prevHipYNorm = smoothedHipYNorm;
+
+    // Horizontal Velocity (rate of side movement)
+    this.horizontalVelocity = Math.abs(smoothedVisualX - this.prevVisualX) / dt;
+    this.prevVisualX = smoothedVisualX;
+
     this.lastTimestamp = timestamp;
 
     // ---------------------------------------------------------
@@ -306,12 +331,12 @@ class BodyPoseClassifier {
         this.internalState = "IDLE";
       }
 
-      this.updateTelemetry(avgKneeAngle, leftKneeAngle ?? 170, rightKneeAngle ?? 170, 0, 0, 0, smoothedVisualX, 0);
+      this.updateTelemetry(avgKneeAngle, leftKneeAngle ?? 170, rightKneeAngle ?? 170, 0, 0, 0, smoothedVisualX, 0, 0);
       return { label: `CALIBRATING...`, state: "CALIBRATING", position: position };
     }
 
     // ---------------------------------------------------------
-    // RELATIVE GEOMETRY & MULTI-SIGNAL SQUAT CONFIDENCE
+    // MULTI-SIGNAL POSTURE SCORE (SQUATTING vs STANDING UP vs IDLE)
     // ---------------------------------------------------------
     const kneeFlexion = Math.max(0, this.baseline.kneeAngle - avgKneeAngle);
     const kneeFlexionScore = clamp(kneeFlexion / 32, 0, 1);
@@ -335,9 +360,27 @@ class BodyPoseClassifier {
     this.smooth.squatScore = squatScore;
 
     // ---------------------------------------------------------
-    // CRITICAL FIX: GROUND BASELINE & AIRBORNE FEET DISPLACEMENT
+    // RUNNING DETECTION SIGNALS (Alternating leg pumping & speed)
     // ---------------------------------------------------------
-    // Measure foot/ankle elevation above calibrated standing floor level
+    const leftKneeDelta = Math.abs((leftKneeAngle ?? 170) - this.prevLeftKneeAngle) / dt;
+    const rightKneeDelta = Math.abs((rightKneeAngle ?? 170) - this.prevRightKneeAngle) / dt;
+    this.prevLeftKneeAngle = leftKneeAngle ?? 170;
+    this.prevRightKneeAngle = rightKneeAngle ?? 170;
+
+    // Knee height difference (alternating high knees)
+    const kneeHeightDiff = (LK && RK) ? Math.abs(LK.y - RK.y) / scale : 0;
+    
+    // Leg pumping motion score
+    const legPumpingScore = clamp((leftKneeDelta + rightKneeDelta) / 200, 0, 1) * 0.5 + clamp(kneeHeightDiff / 0.35, 0, 1) * 0.5;
+    
+    // Total Running Score combines leg pumping + horizontal stride velocity
+    const rawRunningScore = legPumpingScore * 0.65 + clamp(this.horizontalVelocity / 0.8, 0, 1) * 0.35;
+    const runningScore = ema(this.smooth.runningScore, rawRunningScore, 0.35);
+    this.smooth.runningScore = runningScore;
+
+    // ---------------------------------------------------------
+    // GROUND BASELINE & AIRBORNE FEET DISPLACEMENT
+    // ---------------------------------------------------------
     const ankleRiseLeft = LA ? (this.baseline.ankleYNorm - LA.y / scale) : 0;
     const ankleRiseRight = RA ? (this.baseline.ankleYNorm - RA.y / scale) : 0;
     
@@ -347,14 +390,11 @@ class BodyPoseClassifier {
     if (RA) { ankleRiseSum += ankleRiseRight; validAnkleCount++; }
     const avgAnkleRise = validAnkleCount > 0 ? ankleRiseSum / validAnkleCount : 0;
 
-    // Feet are grounded if ankles remain within 0.16 * torso scale of baseline floor level
     const feetGrounded = avgAnkleRise < 0.16;
-    
-    // Genuine airborne condition requires BOTH feet to leave the ground significantly
     const feetAirborne = avgAnkleRise > 0.22 && (validAnkleCount < 2 || (ankleRiseLeft > 0.14 && ankleRiseRight > 0.14));
 
     // Dynamic Baseline Refinement (slow update during stable standing)
-    if (this.visibleState === "IDLE" && Math.abs(this.verticalVelocity) < 0.15 && squatScore < 0.2 && feetGrounded) {
+    if (this.visibleState === "IDLE" && Math.abs(this.verticalVelocity) < 0.15 && squatScore < CONFIG.STANDING_THRESHOLD && feetGrounded) {
       this.baseline.hipYNorm = ema(this.baseline.hipYNorm, currentHipYNorm, 0.005);
       this.baseline.kneeAngle = ema(this.baseline.kneeAngle, avgKneeAngle, 0.005);
       this.baseline.ankleYNorm = ema(this.baseline.ankleYNorm, currentAnkleYNorm, 0.005);
@@ -363,62 +403,71 @@ class BodyPoseClassifier {
     }
 
     // ---------------------------------------------------------
-    // SQUAT RECOVERY & STATE MACHINE SUPPRESSION
+    // SQUATTING vs STANDING UP vs IDLE POSTURE ZONE LOGIC
     // ---------------------------------------------------------
     const isKneeUnbending = avgKneeAngle > (this.prevKneeAngle + 1.2);
     const isHipRising = hipDrop < (this.prevHipDrop - 0.02);
     this.prevKneeAngle = avgKneeAngle;
     this.prevHipDrop = hipDrop;
 
-    // Detect if user is standing up from a squat (SQUAT RECOVERY)
-    const isSquatRecovery = (this.internalState === "SQUATTING" || this.internalState === "RECOVERING") && 
-                             (isKneeUnbending || isHipRising || squatScore < 0.48);
+    // Detect if user is actively rising from squat (STANDING UP transition)
+    const isStandingUpTransition = (this.internalState === "SQUATTING" || this.internalState === "STANDING_UP") &&
+                                   (isKneeUnbending || isHipRising || (squatScore < CONFIG.SQUAT_THRESHOLD && squatScore > CONFIG.STANDING_THRESHOLD));
 
-    if (isSquatRecovery) {
-      this.internalState = "RECOVERING";
-      this.squatDebounce = Math.max(0, this.squatDebounce - 1);
-      // HARD LOCKOUT: Suppress jump detection completely while standing up with feet grounded!
-      this.airborneFrames = 0;
-    } else if (squatScore >= 0.52) {
+    if (squatScore >= CONFIG.SQUAT_THRESHOLD && !isKneeUnbending) {
       this.internalState = "SQUATTING";
       this.squatDebounce = clamp(this.squatDebounce + 1, 0, 10);
+      this.standingUpDebounce = 0;
       this.idleDebounce = 0;
-    } else if (squatScore < 0.32) {
+    } else if (isStandingUpTransition && squatScore > CONFIG.STANDING_THRESHOLD) {
+      this.internalState = "STANDING_UP";
+      this.standingUpDebounce = clamp(this.standingUpDebounce + 1, 0, 10);
+      this.squatDebounce = Math.max(0, this.squatDebounce - 1);
+      this.airborneFrames = 0; // Hard lockout: jump suppressed during standing up
+    } else if (squatScore <= CONFIG.STANDING_THRESHOLD && avgKneeAngle >= (this.baseline.kneeAngle - 8)) {
       this.idleDebounce = clamp(this.idleDebounce + 1, 0, 10);
-      if (this.idleDebounce >= 3) {
-        this.squatDebounce = Math.max(0, this.squatDebounce - 1);
+      if (this.idleDebounce >= CONFIG.STATE_CONFIRMATION_FRAMES) {
+        this.internalState = "IDLE";
+        this.squatDebounce = 0;
+        this.standingUpDebounce = 0;
       }
     }
 
     // ---------------------------------------------------------
-    // JUMP DETECTION LOGIC (REQUIRES AIRBORNE FEET EVIDENCE)
+    // RUNNING & JUMPING MOVEMENT EVALUATION
     // ---------------------------------------------------------
-    // Upward hip velocity alone is NEVER sufficient if feet remain grounded!
-    const jumpSignal = feetAirborne && (this.verticalVelocity > 0.45 || hipDrop < -0.15) && !isSquatRecovery && feetGrounded === false;
+    const isRunningSignal = runningScore > 0.48 && feetGrounded && Math.abs(this.verticalVelocity) < 0.6;
+    if (isRunningSignal) {
+      this.runningFrames = clamp(this.runningFrames + 2, 0, 10);
+    } else {
+      this.runningFrames = Math.max(0, this.runningFrames - 1);
+    }
 
+    const jumpSignal = feetAirborne && (this.verticalVelocity > 0.45 || hipDrop < -0.15) && !isStandingUpTransition && !feetGrounded;
     if (jumpSignal) {
-      this.internalState = "JUMPING";
       this.airborneFrames = clamp(this.airborneFrames + 2, 0, 10);
     } else {
       this.airborneFrames = Math.max(0, this.airborneFrames - 1);
     }
 
-    // Determine Visible Output State (IDLE, SQUATTING, or JUMPING)
-    if (this.airborneFrames >= 3 && feetAirborne) {
+    // ---------------------------------------------------------
+    // HIERARCHICAL VISIBLE STATE SELECTION (Priority Order)
+    // 1. RUNNING + direction
+    // 2. JUMPING + direction
+    // 3. SQUATTING + direction
+    // 4. STANDING UP + direction
+    // 5. IDLE + direction
+    // ---------------------------------------------------------
+    if (this.runningFrames >= CONFIG.RUNNING_CONFIRMATION_FRAMES) {
+      this.visibleState = "RUNNING";
+    } else if (this.airborneFrames >= CONFIG.JUMP_CONFIRMATION_FRAMES && feetAirborne) {
       this.visibleState = "JUMPING";
-    } else if (this.squatDebounce >= 4 && !isSquatRecovery) {
+    } else if (this.squatDebounce >= CONFIG.STATE_CONFIRMATION_FRAMES && squatScore >= CONFIG.SQUAT_THRESHOLD) {
       this.visibleState = "SQUATTING";
-    } else if (this.internalState === "RECOVERING") {
-      // Smooth visual transition: remain SQUATTING until user is mostly upright, then switch to IDLE
-      if (this.squatDebounce > 1 && squatScore > 0.38) {
-        this.visibleState = "SQUATTING";
-      } else {
-        this.visibleState = "IDLE";
-        if (this.squatDebounce === 0) this.internalState = "IDLE";
-      }
-    } else if (this.idleDebounce >= 3 || this.squatDebounce === 0) {
+    } else if (this.internalState === "STANDING_UP" || (squatScore > CONFIG.STANDING_THRESHOLD && squatScore < CONFIG.SQUAT_THRESHOLD)) {
+      this.visibleState = "STANDING UP";
+    } else {
       this.visibleState = "IDLE";
-      this.internalState = "IDLE";
     }
 
     // Update Telemetry
@@ -430,7 +479,8 @@ class BodyPoseClassifier {
       avgAnkleRise, 
       this.verticalVelocity, 
       smoothedVisualX, 
-      squatScore
+      squatScore,
+      runningScore
     );
 
     return {
@@ -446,7 +496,7 @@ class BodyPoseClassifier {
     return "CENTER";
   }
 
-  updateTelemetry(avgKnee, lKnee, rKnee, hipDrop, ankleRise, velocity, visualX, squatScore) {
+  updateTelemetry(avgKnee, lKnee, rKnee, hipDrop, ankleRise, velocity, visualX, squatScore, runningScore) {
     this.telemetry = {
       state: `${this.visibleState} (Internal: ${this.internalState})`,
       position: this.position,
@@ -457,11 +507,11 @@ class BodyPoseClassifier {
       baselineKnee: Math.round(this.baseline.kneeAngle),
       hipDrop: hipDrop.toFixed(2),
       squatScore: (squatScore * 100).toFixed(0) + "%",
+      runningScore: (runningScore * 100).toFixed(0) + "%",
       ankleRise: ankleRise.toFixed(2),
       velocity: (velocity >= 0 ? "+" : "") + velocity.toFixed(2),
       visualX: visualX.toFixed(2),
-      squatDebounce: `${this.squatDebounce}/4`,
-      airborneFrames: `${this.airborneFrames}/3`
+      debounce: `Squat ${this.squatDebounce} | StandUp ${this.standingUpDebounce} | Run ${this.runningFrames} | Air ${this.airborneFrames}`
     };
   }
 }
@@ -572,11 +622,12 @@ async function loop() {
           `State: ${t.state} | Position: ${t.position}\n` +
           `Calibration: ${t.calibrated}\n` +
           `Visual X (Screen): ${t.visualX}\n` +
-          `Squat Score: ${t.squatScore} (Debounce: ${t.squatDebounce})\n` +
+          `Squat Score: ${t.squatScore} | Run Score: ${t.runningScore}\n` +
           `Left Knee: ${t.leftKnee}° | Right Knee: ${t.rightKnee}°\n` +
           `Avg Knee: ${t.avgKnee}° (Baseline: ${t.baselineKnee}°)\n` +
           `Hip Drop: ${t.hipDrop} | Velocity: ${t.velocity}\n` +
-          `Ankle Rise: ${t.ankleRise} | Airborne: ${t.airborneFrames}`;
+          `Ankle Rise: ${t.ankleRise}\n` +
+          `Debounce: ${t.debounce}`;
       }
     } else {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
