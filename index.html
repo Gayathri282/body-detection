@@ -417,11 +417,25 @@ class BodyPoseClassifier {
     const maxHipRiseInWindow = this.baseline.hipYNorm - minHipY;
 
     // ---------------------------------------------------------
+    // GROUND BASELINE & ANKLE ELEVATION METRICS
+    // ---------------------------------------------------------
+    const ankleRiseLeft = LA ? (this.baseline.ankleYNorm - LA.y / scale) : 0;
+    const ankleRiseRight = RA ? (this.baseline.ankleYNorm - RA.y / scale) : 0;
+    
+    let validAnkleCount = 0;
+    let ankleRiseSum = 0;
+    if (LA) { ankleRiseSum += ankleRiseLeft; validAnkleCount++; }
+    if (RA) { ankleRiseSum += ankleRiseRight; validAnkleCount++; }
+    const avgAnkleRise = validAnkleCount > 0 ? ankleRiseSum / validAnkleCount : 0;
+
+    const feetGrounded = avgAnkleRise < 0.14;
+    const feetAirborne = avgAnkleRise > 0.15 || (ankleRiseLeft > 0.11 && ankleRiseRight > 0.11);
+
+    // ---------------------------------------------------------
     // CONFIDENCE SCORE & ACTION PATTERN EVALUATIONS
     // ---------------------------------------------------------
     
     // 1. IDLE CONFIDENCE: Upright stance, extended knees (>135 deg), grounded feet
-    const feetGrounded = avgAnkleRise < 0.14;
     const isUprightStance = avgKneeAngle > 135 && this.hipDeltaNorm > -0.06 && feetGrounded;
     const rawIdleConfidence = isUprightStance ? 0.95 : 0.20;
     this.conf.idle = ema(this.smooth.idle, rawIdleConfidence, 0.35);
@@ -467,7 +481,6 @@ class BodyPoseClassifier {
 
     // 4. JUMP CONFIDENCE: Airborne feet elevation & vertical upward acceleration
     // ARMS/HANDS IGNORED 100%: Evaluates vertical trajectory & foot elevation!
-    const feetAirborne = avgAnkleRise > 0.15 || (ankleRiseLeft > 0.11 && ankleRiseRight > 0.11);
     const headRiseScore = clamp(Math.max(0, this.headDeltaNorm) / 0.08, 0, 1);
     const upwardVelScore = clamp(this.verticalVelocity / 0.45, 0, 1);
 
