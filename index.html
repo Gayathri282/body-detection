@@ -124,10 +124,11 @@ let showDebug = false;
 const CONFIG = {
   SQUAT_THRESHOLD: 0.48,            // Squat score threshold to trigger SQUATTING
   IDLE_UPRIGHT_THRESHOLD: 0.20,     // Max squat score to enter IDLE stance
-  RUNNING_ENTER_THRESHOLD: 0.40,    // Running score threshold to activate RUNNING
-  RUNNING_EXIT_THRESHOLD: 0.22,     // Running score threshold to exit RUNNING
+  RUNNING_ENTER_THRESHOLD: 0.62,    // High threshold to prevent false positives (False negative preferred)
+  RUNNING_EXIT_THRESHOLD: 0.32,     // Running exit threshold
+  MOVEMENT_DEADZONE: 0.25,          // Velocity dead-zone below which motion score is forced to 0
   STATE_CONFIRMATION_FRAMES: 3,     // Debounce frames required for posture transitions
-  RUNNING_CONFIRMATION_FRAMES: 3,   // Debounce frames to confirm RUNNING
+  RUNNING_CONFIRMATION_FRAMES: 5,   // Debounce frames to confirm RUNNING (5 frames ~ 0.16s)
   JUMP_CONFIRMATION_FRAMES: 3       // Debounce frames to confirm JUMPING
 };
 
@@ -200,12 +201,15 @@ class BodyPoseClassifier {
     this.prevKneeAngle = 170;
     this.prevVisualX = 0.5;
     
-    // Landmark history for running velocity calculations
+    // Landmark history for motion velocity calculations
     this.prevLA = null;
     this.prevRA = null;
+    this.prevLK = null;
+    this.prevRK = null;
     
     this.verticalVelocity = 0;
     this.horizontalVelocity = 0;
+    this.avgLegMotionVel = 0;
     
     // Debounce & State Machine Counters
     this.squatDebounce = 0;
@@ -363,24 +367,37 @@ class BodyPoseClassifier {
     this.smooth.squatScore = squatScore;
 
     // ---------------------------------------------------------
-    // ROBUST RUNNING DETECTION ENGINE
-    // Evaluates: 1) Knee Angle Asymmetry, 2) High Knee Y Diff, 3) Ankle Vertical Speed
-    // Works for BOTH running in place AND horizontal running!
+    // DYNAMIC RUNNING ENGINE WITH MOVEMENT DEAD-ZONE & VELOCITY FILTER
+    // Evaluates: 1) Active Leg Motion Velocity, 2) Alternating Knee Speed, 3) Knee Y Diff
+    // Prevents FALSE POSITIVES while standing still or shifting weight!
     // ---------------------------------------------------------
-    const kneeAngleDiff = Math.abs((leftKneeAngle ?? 170) - (rightKneeAngle ?? 170));
-    const kneeAsymmetryScore = clamp(kneeAngleDiff / 25, 0, 1);
-
-    const kneeYDiff = (LK && RK) ? Math.abs(LK.y - RK.y) / scale : 0;
-    const kneeHeightScore = clamp(kneeYDiff / 0.12, 0, 1);
-
-    const leftAnkleVel = LA && this.prevLA ? Math.abs(LA.y - this.prevLA.y) / (dt * scale) : 0;
-    const rightAnkleVel = RA && this.prevRA ? Math.abs(RA.y - this.prevRA.y) / (dt * scale) : 0;
-    const ankleVelScore = clamp((leftAnkleVel + rightAnkleVel) / 0.8, 0, 1);
+    const leftAnkleVel = LA && this.prevLA ? dist(LA, this.prevLA) / (dt * scale) : 0;
+    const rightAnkleVel = RA && this.prevRA ? dist(RA, this.prevRA) / (dt * scale) : 0;
+    const leftKneeVel = LK && this.prevLK ? dist(LK, this.prevLK) / (dt * scale) : 0;
+    const rightKneeVel = RK && this.prevRK ? dist(RK, this.prevRK) / (dt * scale) : 0;
 
     this.prevLA = LA ? { x: LA.x, y: LA.y } : null;
     this.prevRA = RA ? { x: RA.x, y: RA.y } : null;
+    this.prevLK = LK ? { x: LK.x, y: LK.y } : null;
+    this.prevRK = RK ? { x: RK.x, y: RK.y } : null;
 
-    const rawRunningScore = kneeAsymmetryScore * 0.40 + kneeHeightScore * 0.35 + ankleVelScore * 0.25;
+    const avgLegMotionVel = (leftAnkleVel + rightAnkleVel + leftKneeVel + rightKneeVel) / 4;
+    this.avgLegMotionVel = avgLegMotionVel;
+
+    // MOVEMENT DEAD-ZONE GUARD: If overall leg motion velocity is below dead-zone, running score IS ZERO!
+    let rawRunningScore = 0;
+    if (avgLegMotionVel >= CONFIG.MOVEMENT_DEADZONE) {
+      const motionScore = clamp((avgLegMotionVel - CONFIG.MOVEMENT_DEADZONE) / 0.65, 0, 1);
+      const kneeYDiff = (LK && RK) ? Math.abs(LK.y - RK.y) / scale : 0;
+      const kneeHeightScore = clamp(kneeYDiff / 0.14, 0, 1);
+      const velAsymmetry = Math.abs(leftAnkleVel - rightAnkleVel);
+      const velAsymmetryScore = clamp(velAsymmetry / 0.50, 0, 1);
+
+      rawRunningScore = motionScore * 0.45 + velAsymmetryScore * 0.35 + kneeHeightScore * 0.20;
+    } else {
+      rawRunningScore = 0;
+    }
+
     const runningScore = ema(this.smooth.runningScore, rawRunningScore, 0.35);
     this.smooth.runningScore = runningScore;
 
@@ -425,7 +442,13 @@ class BodyPoseClassifier {
 
     // Movement Signals
     const isJumpingSignal = (feetAirborne || (this.verticalVelocity > 0.50 && avgAnkleRise > 0.10)) && !isSquattingSignal;
-    const isRunningSignal = runningScore >= CONFIG.RUNNING_ENTER_THRESHOLD && feetGrounded && !isSquattingSignal;
+    
+    // Strict Running Signal: High running score AND leg motion velocity above dead-zone AND NOT standing still
+    const isStandingStill = isIdleSignal && avgLegMotionVel < (CONFIG.MOVEMENT_DEADZONE * 1.5);
+    const isRunningSignal = runningScore >= CONFIG.RUNNING_ENTER_THRESHOLD && 
+                            feetGrounded && 
+                            !isSquattingSignal && 
+                            !isStandingStill;
 
     // Jump Debounce
     if (isJumpingSignal) {
@@ -437,7 +460,7 @@ class BodyPoseClassifier {
     // Running Debounce with Hysteresis
     if (isRunningSignal) {
       this.runningFrames = clamp(this.runningFrames + 2, 0, 10);
-    } else if (runningScore < CONFIG.RUNNING_EXIT_THRESHOLD) {
+    } else if (runningScore < CONFIG.RUNNING_EXIT_THRESHOLD || isStandingStill) {
       this.runningFrames = Math.max(0, this.runningFrames - 1);
     }
 
@@ -516,6 +539,7 @@ class BodyPoseClassifier {
       hipDrop: hipDrop.toFixed(2),
       squatScore: (squatScore * 100).toFixed(0) + "%",
       runningScore: (runningScore * 100).toFixed(0) + "%",
+      legMotionVel: this.avgLegMotionVel.toFixed(2),
       ankleRise: ankleRise.toFixed(2),
       velocity: (velocity >= 0 ? "+" : "") + velocity.toFixed(2),
       visualX: visualX.toFixed(2),
@@ -631,6 +655,7 @@ async function loop() {
           `Calibration: ${t.calibrated}\n` +
           `Visual X (Screen): ${t.visualX}\n` +
           `Squat Score: ${t.squatScore} | Run Score: ${t.runningScore}\n` +
+          `Leg Motion Speed: ${t.legMotionVel}\n` +
           `Left Knee: ${t.leftKnee}° | Right Knee: ${t.rightKnee}°\n` +
           `Avg Knee: ${t.avgKnee}° (Baseline: ${t.baselineKnee}°)\n` +
           `Hip Drop: ${t.hipDrop} | Velocity: ${t.velocity}\n` +
