@@ -219,11 +219,12 @@ class BodyPoseClassifier {
     this.horizontalVelocity = 0;
     this.avgLegMotionVel = 0;
     
-    // Debounce counters
+    // Debounce & cooldown counters
     this.idleFrames = 0;
     this.squatFrames = 0;
     this.airborneFrames = 0;
     this.runningFrames = 0;
+    this.jumpCooldownFrames = 0;
     this.missingPersonFrames = 0;
     
     // Raw telemetry for debug overlay
@@ -236,33 +237,30 @@ class BodyPoseClassifier {
     this.internalState = "CALIBRATING";
   }
 
-  // Multi-region person detection filter with 12-frame hangover
+  // ROBUST PERSON DETECTION: Checks for core torso presence (Shoulders 11,12 & Hips 23,24)
+  // Does NOT depend on lower ankle visibility, preventing false NO PERSON when standing still/centered!
   checkPersonPresence(lm) {
-    if (!lm || lm.length < 29) return false;
+    if (!lm || lm.length < 25) return false;
     
-    const checkGroup = (indices) => indices.some(idx => lm[idx] && (lm[idx].visibility ?? 1) > 0.35);
+    const LS = lm[11], RS = lm[12], LH = lm[23], RH = lm[24];
+    const vis = (pt) => pt && (pt.visibility ?? 1) > 0.20;
     
-    const head = checkGroup([0, 2, 5, 7, 8]);
-    const shoulders = checkGroup([11, 12]);
-    const hips = checkGroup([23, 24]);
-    const knees = checkGroup([25, 26]);
-    const ankles = checkGroup([27, 28]);
-
-    const presentNow = [head, shoulders, hips, knees, ankles].filter(Boolean).length >= 4;
-
-    if (presentNow) {
+    const hasTorso = (vis(LS) || vis(RS)) && (vis(LH) || vis(RH));
+    
+    if (hasTorso) {
       this.missingPersonFrames = 0;
       return true;
     } else {
       this.missingPersonFrames++;
-      return this.missingPersonFrames <= 12;
+      // 30-frame (~1s) hangover window before declaring NO PERSON
+      return this.missingPersonFrames <= 30;
     }
   }
 
   processFrame(lm, timestamp) {
     if (!this.checkPersonPresence(lm)) {
       this.internalState = "UNKNOWN";
-      return { label: "NO PERSON", state: "UNKNOWN", position: "CENTER" };
+      return { label: "NO PERSON", state: "NO PERSON", position: "CENTER" };
     }
 
     // Key Landmarks
@@ -290,8 +288,8 @@ class BodyPoseClassifier {
     const scale = torsoLen;
 
     // Normalized Body Geometry & Proportions
-    const visLK = (LK?.visibility ?? 1) > 0.35;
-    const visRK = (RK?.visibility ?? 1) > 0.35;
+    const visLK = (LK?.visibility ?? 1) > 0.25;
+    const visRK = (RK?.visibility ?? 1) > 0.25;
 
     const leftKneeAngle = visLK ? calculateAngle(LH, LK, LA) : null;
     const rightKneeAngle = visRK ? calculateAngle(RH, RK, RA) : null;
@@ -388,21 +386,22 @@ class BodyPoseClassifier {
 
     // 2. SQUAT CONFIDENCE: Lower-body squat geometry (reduced hip height, bent knees)
     const kneeFlexion = Math.max(0, this.baseline.kneeAngle - avgKneeAngle);
-    const kneeFlexionScore = clamp(kneeFlexion / 34, 0, 1);
+    const kneeFlexionScore = clamp(kneeFlexion / 22, 0, 1); // 22 deg drop gives full score
     const hipDrop = Math.max(0, smoothedHipYNorm - this.baseline.hipYNorm);
-    const hipDropScore = clamp(hipDrop / 0.22, 0, 1);
-    const thighDelta = Math.max(0, avgThighAngle - this.baseline.thighAngle);
-    const thighAngleScore = clamp(thighDelta / 28, 0, 1);
+    const hipDropScore = clamp(hipDrop / 0.14, 0, 1);
     const legCompression = Math.max(0, this.baseline.legDistNorm - currentLegDistNorm);
-    const legCompressionScore = clamp(legCompression / 0.22, 0, 1);
+    const legCompressionScore = clamp(legCompression / 0.14, 0, 1);
 
-    const rawSquatConfidence = kneeFlexionScore * 0.40 + hipDropScore * 0.30 + thighAngleScore * 0.20 + legCompressionScore * 0.10;
+    const rawSquatConfidence = kneeFlexionScore * 0.45 + hipDropScore * 0.35 + legCompressionScore * 0.20;
     this.conf.squat = ema(this.smooth.squat, rawSquatConfidence, 0.35);
     this.smooth.squat = this.conf.squat;
 
     // 3. RUNNING CONFIDENCE: Sustained leg motion velocity + leg alternation
     let rawRunningConfidence = 0;
-    if (avgLegMotionVel >= CONFIG.MOVEMENT_DEADZONE) {
+    if (this.jumpCooldownFrames > 0) {
+      this.jumpCooldownFrames--;
+      rawRunningConfidence = 0; // POST-JUMP LANDING GUARD: Force running to 0 during landing
+    } else if (avgLegMotionVel >= CONFIG.MOVEMENT_DEADZONE) {
       const motionScore = clamp((avgLegMotionVel - CONFIG.MOVEMENT_DEADZONE) / 0.60, 0, 1);
       const kneeYDiff = (LK && RK) ? Math.abs(LK.y - RK.y) / scale : 0;
       const kneeHeightScore = clamp(kneeYDiff / 0.14, 0, 1);
@@ -415,7 +414,7 @@ class BodyPoseClassifier {
     }
 
     // Guard: If standing upright with minimal motion, running confidence IS strictly ZERO
-    if (this.conf.idle > 0.70 && avgLegMotionVel < (CONFIG.MOVEMENT_DEADZONE * 1.4)) {
+    if (this.conf.idle > 0.65 && avgLegMotionVel < (CONFIG.MOVEMENT_DEADZONE * 1.4)) {
       rawRunningConfidence = 0;
     }
 
@@ -461,7 +460,7 @@ class BodyPoseClassifier {
       this.airborneFrames = Math.max(0, this.airborneFrames - 1);
     }
 
-    if (this.conf.running >= CONFIG.RUNNING_THRESHOLD && this.airborneFrames === 0 && feetGrounded) {
+    if (this.conf.running >= CONFIG.RUNNING_THRESHOLD && this.airborneFrames === 0 && feetGrounded && this.jumpCooldownFrames === 0) {
       this.runningFrames = clamp(this.runningFrames + 2, 0, 10);
     } else {
       this.runningFrames = Math.max(0, this.runningFrames - 1);
@@ -483,16 +482,17 @@ class BodyPoseClassifier {
     // ---------------------------------------------------------
     // HIERARCHICAL VISIBLE STATE SELECTION (STRICT 12 VISIBLE STATES)
     // Priorities:
-    // 1. JUMPING  (Airborne elevation confirmed)
+    // 1. JUMPING  (Airborne elevation confirmed) -> Triggers jumpCooldownFrames = 15 on landing
     // 2. RUNNING  (Sustained leg motion pattern confirmed)
     // 3. SQUATTING (Lower body squat posture confirmed)
     // 4. IDLE     (Standing posture confirmed)
     // ---------------------------------------------------------
     if (this.airborneFrames >= CONFIG.JUMP_CONFIRMATION_FRAMES) {
       this.visibleState = "JUMPING";
-    } else if (this.runningFrames >= CONFIG.RUNNING_CONFIRMATION_FRAMES) {
+      this.jumpCooldownFrames = 15; // Set 15-frame landing cooldown to block RUNNING flicker
+    } else if (this.runningFrames >= CONFIG.RUNNING_CONFIRMATION_FRAMES && this.jumpCooldownFrames === 0) {
       this.visibleState = "RUNNING";
-    } else if (this.squatFrames >= CONFIG.STATE_CONFIRMATION_FRAMES) {
+    } else if (this.squatFrames >= CONFIG.STATE_CONFIRMATION_FRAMES && this.jumpCooldownFrames === 0) {
       this.visibleState = "SQUATTING";
     } else if (this.idleFrames >= CONFIG.STATE_CONFIRMATION_FRAMES) {
       this.visibleState = "IDLE";
@@ -547,7 +547,7 @@ class BodyPoseClassifier {
       ankleRise: ankleRise.toFixed(2),
       velocity: (velocity >= 0 ? "+" : "") + velocity.toFixed(2),
       visualX: visualX.toFixed(2),
-      debounce: `Idle ${this.idleFrames} | Squat ${this.squatFrames} | Run ${this.runningFrames} | Air ${this.airborneFrames}`
+      debounce: `Idle ${this.idleFrames} | Squat ${this.squatFrames} | Run ${this.runningFrames} | Air ${this.airborneFrames} | Cooldown ${this.jumpCooldownFrames}`
     };
   }
 }
