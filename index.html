@@ -1,0 +1,623 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Body State Detector</title>
+<link rel="icon" href="data:,">
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#050508;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+body{display:flex;align-items:center;justify-content:center}
+#app{width:100vw;height:100vh;position:relative;overflow:hidden}
+
+/* Main Pose State Banner */
+#state{
+  position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  text-align:center;font-weight:900;font-size:clamp(36px,6.5vw,96px);
+  letter-spacing:.05em;pointer-events:none;text-transform:uppercase;
+  text-shadow:0 0 30px rgba(0,229,255,0.25);
+  transition:all .2s ease-out;
+}
+
+/* Header Status */
+#status{
+  position:absolute;top:20px;left:24px;font-size:13px;font-weight:500;
+  color:#a0a5b5;z-index:10;max-width:65%;letter-spacing:.02em;
+  background:rgba(15,17,23,0.75);backdrop-filter:blur(8px);
+  padding:8px 14px;border-radius:20px;border:1px solid rgba(255,255,255,0.08);
+}
+
+/* Control Buttons */
+#controls{
+  position:absolute;bottom:24px;left:24px;z-index:10;
+  display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+}
+button{
+  background:#ffffff;color:#0b0c10;border:0;border-radius:8px;
+  padding:10px 18px;font-size:13px;font-weight:700;cursor:pointer;
+  transition:all .15s ease;box-shadow:0 4px 12px rgba(0,0,0,0.3);
+}
+button:hover:not(:disabled){background:#e2e8f0;transform:translateY(-1px)}
+button:active:not(:disabled){transform:translateY(0)}
+button:disabled{opacity:.4;cursor:not-allowed;box-shadow:none}
+button.sec{
+  background:rgba(255,255,255,0.12);color:#fff;border:1px solid rgba(255,255,255,0.2);
+}
+button.sec:hover:not(:disabled){background:rgba(255,255,255,0.2)}
+
+/* Camera Preview Box */
+#camBox{
+  position:absolute;right:24px;bottom:24px;z-index:10;
+  width:min(35vw,360px);aspect-ratio:4/3;
+  border:1px solid rgba(255,255,255,0.15);border-radius:12px;
+  overflow:hidden;background:#0d0f14;box-shadow:0 8px 32px rgba(0,0,0,0.6);
+}
+video,canvas{position:absolute;width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+
+/* Guide Hint */
+#hint{
+  position:absolute;right:24px;top:20px;color:#71788e;font-size:12px;
+  text-align:right;line-height:1.6;z-index:10;font-weight:500;
+}
+
+/* Telemetry / Debug Overlay */
+#debug{
+  position:absolute;left:24px;bottom:80px;color:#00e5ff;
+  font:11px/1.5 "SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
+  white-space:pre-line;z-index:10;background:rgba(10,12,18,0.85);
+  backdrop-filter:blur(10px);padding:12px 16px;border-radius:10px;
+  border:1px solid rgba(0,229,255,0.2);display:none;
+  max-width:340px;box-shadow:0 8px 24px rgba(0,0,0,0.5);
+}
+#debug.active{display:block}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="status">Camera: off · Pose model: loading…</div>
+  <div id="hint">LEFT · CENTER · RIGHT<br>IDLE · JUMPING · SQUATTING</div>
+  <div id="state">CAMERA OFF</div>
+  
+  <div id="camBox">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="canvas"></canvas>
+  </div>
+  
+  <div id="controls">
+    <button id="start">Start camera</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="recal" class="sec" disabled>Recalibrate</button>
+    <button id="toggleDebug" class="sec">Debug Info</button>
+  </div>
+  
+  <div id="debug"></div>
+</div>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver, DrawingUtils } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/+esm";
+
+// Catch & suppress browser extension message port errors
+window.addEventListener("unhandledrejection", (event) => {
+  if (event.reason && event.reason.message && event.reason.message.includes("message channel closed")) {
+    event.preventDefault();
+  }
+});
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const stateEl = document.getElementById("state");
+const statusEl = document.getElementById("status");
+const debugEl = document.getElementById("debug");
+const startBtn = document.getElementById("start");
+const stopBtn = document.getElementById("stop");
+const recalBtn = document.getElementById("recal");
+const toggleDebugBtn = document.getElementById("toggleDebug");
+
+let stream = null, landmarker = null, running = false, lastVideoTime = -1;
+let showDebug = false;
+
+// -------------------------------------------------------------
+// MATH & SKELETON GEOMETRY UTILITIES
+// -------------------------------------------------------------
+function dist(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function mid(a, b) {
+  return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+}
+
+function clamp(v, min, max) {
+  return Math.max(min, Math.min(max, v));
+}
+
+function ema(oldVal, newVal, alpha = 0.3) {
+  return oldVal == null ? newVal : oldVal * (1 - alpha) + newVal * alpha;
+}
+
+// Calculates 2D interior angle at vertex B formed by points A-B-C (in degrees 0..180)
+function calculateAngle(A, B, C) {
+  if (!A || !B || !C) return 180;
+  const rad = Math.atan2(C.y - B.y, C.x - B.x) - Math.atan2(A.y - B.y, A.x - B.x);
+  let deg = Math.abs((rad * 180) / Math.PI);
+  if (deg > 180) deg = 360 - deg;
+  return deg;
+}
+
+// Calculates thigh angle relative to vertical axis (0 deg = straight down, 90 deg = horizontal)
+function calculateThighAngle(hip, knee) {
+  if (!hip || !knee) return 0;
+  const dx = Math.abs(knee.x - hip.x);
+  const dy = Math.max(0.001, knee.y - hip.y);
+  return (Math.atan2(dx, dy) * 180) / Math.PI;
+}
+
+// -------------------------------------------------------------
+// CLASSIFIER & STATE MACHINE ENGINE
+// -------------------------------------------------------------
+class BodyPoseClassifier {
+  constructor() {
+    this.reset();
+  }
+
+  reset() {
+    this.state = "UNKNOWN"; // UNKNOWN, CALIBRATING, IDLE, SQUATTING, JUMPING
+    this.position = "CENTER"; // LEFT, CENTER, RIGHT
+    this.calibrated = false;
+    this.calibrationFrames = 0;
+    this.targetCalibrationFrames = 45; // ~1.5s at 30fps
+
+    // Baseline metrics (normalized)
+    this.baseline = {
+      kneeAngle: 168,
+      hipYNorm: null,
+      ankleYNorm: null,
+      legDistNorm: null,
+      thighAngle: 10
+    };
+
+    // Temporal tracking buffers & smoothing
+    this.smooth = { visualX: null, hipY: null, squatScore: null };
+    this.lastTimestamp = null;
+    this.prevHipYNorm = null;
+    this.verticalVelocity = 0;
+    
+    // Debounce counters
+    this.squatDebounce = 0;
+    this.idleDebounce = 0;
+    this.airborneFrames = 0;
+    this.missingPersonFrames = 0;
+    
+    // Raw telemetry for debug overlay
+    this.telemetry = {};
+  }
+
+  triggerRecalibration() {
+    this.calibrated = false;
+    this.calibrationFrames = 0;
+    this.state = "CALIBRATING";
+  }
+
+  // Graceful multi-region person detection filter with 12-frame hangover
+  checkPersonPresence(lm) {
+    if (!lm || lm.length < 29) return false;
+    
+    const checkGroup = (indices) => indices.some(idx => lm[idx] && (lm[idx].visibility ?? 1) > 0.35);
+    
+    const head = checkGroup([0, 2, 5, 7, 8]);
+    const shoulders = checkGroup([11, 12]);
+    const hips = checkGroup([23, 24]);
+    const knees = checkGroup([25, 26]);
+    const ankles = checkGroup([27, 28]);
+
+    // Requires presence in at least 4 of 5 major body regions
+    const presentNow = [head, shoulders, hips, knees, ankles].filter(Boolean).length >= 4;
+
+    if (presentNow) {
+      this.missingPersonFrames = 0;
+      return true;
+    } else {
+      this.missingPersonFrames++;
+      // Allow up to 12 frames (~0.4s) of temporary missing landmarks before declaring NO PERSON
+      return this.missingPersonFrames <= 12;
+    }
+  }
+
+  processFrame(lm, timestamp) {
+    if (!this.checkPersonPresence(lm)) {
+      this.state = "UNKNOWN";
+      return { label: "NO PERSON", state: "UNKNOWN", position: "CENTER" };
+    }
+
+    // Key Landmarks (Lower-body primary, shoulders for torso scale)
+    const LS = lm[11], RS = lm[12]; // Shoulders
+    const LH = lm[23], RH = lm[24]; // Hips
+    const LK = lm[25], RK = lm[26]; // Knees
+    const LA = lm[27], RA = lm[28]; // Ankles
+
+    const shoulderMid = mid(LS, RS);
+    const hipMid = mid(LH, RH);
+    const kneeMid = mid(LK, RK);
+    const ankleMid = mid(LA, RA);
+
+    // ---------------------------------------------------------
+    // BUG 1 FIX: VISUAL HORIZONTAL POSITIONING (MIRRORED COMPENSATED)
+    // ---------------------------------------------------------
+    // Raw camera body center X (0 = physical left in unmirrored frame)
+    const rawBodyCenterX = (shoulderMid.x + hipMid.x) / 2;
+    
+    // Compensate for CSS scaleX(-1) preview mirroring: visualX on user's screen
+    const visualX = 1 - rawBodyCenterX;
+    const smoothedVisualX = ema(this.smooth.visualX, visualX, 0.3);
+    this.smooth.visualX = smoothedVisualX;
+
+    const position = this.classifyPosition(smoothedVisualX);
+    this.position = position;
+
+    // ---------------------------------------------------------
+    // SCALE NORMALIZATION: Torso length is the scale-invariant baseline
+    // ---------------------------------------------------------
+    const torsoLen = Math.max(0.06, dist(shoulderMid, hipMid));
+    const scale = torsoLen;
+
+    // Lower-body Geometry: Knee Angles & Thigh Angles (ARMS ENTIRELY IGNORED)
+    const visLK = (LK?.visibility ?? 1) > 0.35;
+    const visRK = (RK?.visibility ?? 1) > 0.35;
+
+    const leftKneeAngle = visLK ? calculateAngle(LH, LK, LA) : null;
+    const rightKneeAngle = visRK ? calculateAngle(RH, RK, RA) : null;
+
+    let validKneeCount = 0;
+    let kneeSum = 0;
+    if (leftKneeAngle != null) { kneeSum += leftKneeAngle; validKneeCount++; }
+    if (rightKneeAngle != null) { kneeSum += rightKneeAngle; validKneeCount++; }
+    const avgKneeAngle = validKneeCount > 0 ? kneeSum / validKneeCount : 170;
+
+    const leftThighAngle = visLK ? calculateThighAngle(LH, LK) : 0;
+    const rightThighAngle = visRK ? calculateThighAngle(RH, RK) : 0;
+    const avgThighAngle = (leftThighAngle + rightThighAngle) / 2;
+
+    const currentHipYNorm = hipMid.y / scale;
+    const currentAnkleYNorm = ankleMid.y / scale;
+    const currentLegDistNorm = dist(hipMid, ankleMid) / scale;
+
+    const smoothedHipYNorm = ema(this.smooth.hipY, currentHipYNorm, 0.3);
+    this.smooth.hipY = smoothedHipYNorm;
+
+    // Vertical Velocity (positive = upward motion)
+    const dt = Math.max(0.016, (timestamp - (this.lastTimestamp ?? timestamp)) / 1000);
+    if (this.prevHipYNorm != null) {
+      this.verticalVelocity = (this.prevHipYNorm - smoothedHipYNorm) / dt;
+    }
+    this.prevHipYNorm = smoothedHipYNorm;
+    this.lastTimestamp = timestamp;
+
+    // ---------------------------------------------------------
+    // BASELINE CALIBRATION (Automatic on startup / recalibrate)
+    // ---------------------------------------------------------
+    if (!this.calibrated || this.state === "CALIBRATING") {
+      this.state = "CALIBRATING";
+      this.calibrationFrames++;
+      
+      this.baseline.kneeAngle = ema(this.baseline.kneeAngle, avgKneeAngle, 0.1);
+      this.baseline.hipYNorm = ema(this.baseline.hipYNorm, currentHipYNorm, 0.1);
+      this.baseline.ankleYNorm = ema(this.baseline.ankleYNorm, currentAnkleYNorm, 0.1);
+      this.baseline.legDistNorm = ema(this.baseline.legDistNorm, currentLegDistNorm, 0.1);
+      this.baseline.thighAngle = ema(this.baseline.thighAngle, avgThighAngle, 0.1);
+
+      if (this.calibrationFrames >= this.targetCalibrationFrames) {
+        this.calibrated = true;
+        this.state = "IDLE";
+      }
+
+      this.updateTelemetry(avgKneeAngle, leftKneeAngle ?? 170, rightKneeAngle ?? 170, 0, 0, 0, smoothedVisualX, 0);
+      return { label: `CALIBRATING...`, state: "CALIBRATING", position: position };
+    }
+
+    // ---------------------------------------------------------
+    // BUG 2 FIX: MULTI-SIGNAL LOWER-BODY SQUAT CONFIDENCE SCORE
+    // (ARMS/ELBOWS/HANDS ARE 100% IGNORED FOR SQUAT DETECT)
+    // ---------------------------------------------------------
+
+    // Signal 1: Knee Flexion Score (Weight 0.45)
+    // Measures degrees of knee bending relative to calibrated standing knee angle
+    const kneeFlexion = Math.max(0, this.baseline.kneeAngle - avgKneeAngle);
+    const kneeFlexionScore = clamp(kneeFlexion / 32, 0, 1);
+
+    // Signal 2: Hip Descent Score (Weight 0.25)
+    // Measures scale-normalized drop of hips relative to standing baseline
+    const hipDrop = smoothedHipYNorm - this.baseline.hipYNorm;
+    const hipDropScore = clamp(hipDrop / 0.22, 0, 1);
+
+    // Signal 3: Thigh Orientation Score (Weight 0.20)
+    // Measures thigh vector tilt relative to vertical axis (standing ~ 5-15 deg, squat ~ 35-70 deg)
+    const thighDelta = Math.max(0, avgThighAngle - this.baseline.thighAngle);
+    const thighAngleScore = clamp(thighDelta / 28, 0, 1);
+
+    // Signal 4: Leg Compression Score (Weight 0.10)
+    // Measures normalized reduction in distance between hip midpoint and ankle midpoint
+    const legCompression = Math.max(0, this.baseline.legDistNorm - currentLegDistNorm);
+    const legCompressionScore = clamp(legCompression / 0.22, 0, 1);
+
+    // Combined Weighted Squat Confidence Score
+    const rawSquatScore = 
+      kneeFlexionScore    * 0.45 +
+      hipDropScore        * 0.25 +
+      thighAngleScore     * 0.20 +
+      legCompressionScore * 0.10;
+
+    const squatScore = ema(this.smooth.squatScore, rawSquatScore, 0.35);
+    this.smooth.squatScore = squatScore;
+
+    // Ankle Rise for Jump Detection
+    const ankleRise = this.baseline.ankleYNorm - currentAnkleYNorm;
+
+    // Dynamic Baseline Refinement (slow update during stable standing)
+    if (this.state === "IDLE" && Math.abs(this.verticalVelocity) < 0.15 && squatScore < 0.2) {
+      this.baseline.hipYNorm = ema(this.baseline.hipYNorm, currentHipYNorm, 0.005);
+      this.baseline.kneeAngle = ema(this.baseline.kneeAngle, avgKneeAngle, 0.005);
+      this.baseline.ankleYNorm = ema(this.baseline.ankleYNorm, currentAnkleYNorm, 0.005);
+      this.baseline.legDistNorm = ema(this.baseline.legDistNorm, currentLegDistNorm, 0.005);
+      this.baseline.thighAngle = ema(this.baseline.thighAngle, avgThighAngle, 0.005);
+    }
+
+    // ---------------------------------------------------------
+    // STATE MACHINE WITH HYSTERESIS DEBOUNCE
+    // ---------------------------------------------------------
+    const jumpUpwardVelocity = this.verticalVelocity > 0.85;
+    const jumpFeetAirborne = ankleRise > 0.22 && hipDrop < -0.10;
+    const jumpSignal = jumpUpwardVelocity || jumpFeetAirborne;
+
+    // 1. Squat Debounce Logic with Hysteresis Thresholds
+    // Enter threshold = 0.52, Exit threshold = 0.32
+    if (squatScore >= 0.52) {
+      this.squatDebounce = clamp(this.squatDebounce + 1, 0, 10);
+      this.idleDebounce = 0;
+    } else if (squatScore < 0.32) {
+      this.idleDebounce = clamp(this.idleDebounce + 1, 0, 10);
+      if (this.idleDebounce >= 3) {
+        this.squatDebounce = Math.max(0, this.squatDebounce - 1);
+      }
+    }
+
+    // 2. Jump Debounce Logic
+    if (jumpSignal) {
+      this.airborneFrames = clamp(this.airborneFrames + 2, 0, 12);
+    } else {
+      this.airborneFrames = Math.max(0, this.airborneFrames - 1);
+    }
+
+    // State Transitions
+    if (this.airborneFrames >= 3) {
+      this.state = "JUMPING";
+    } else if (this.squatDebounce >= 4) {
+      this.state = "SQUATTING";
+    } else if (this.idleDebounce >= 3 || this.squatDebounce === 0) {
+      this.state = "IDLE";
+    }
+
+    // Update Telemetry
+    this.updateTelemetry(
+      avgKneeAngle, 
+      leftKneeAngle ?? 170, 
+      rightKneeAngle ?? 170, 
+      hipDrop, 
+      ankleRise, 
+      this.verticalVelocity, 
+      smoothedVisualX, 
+      squatScore
+    );
+
+    return {
+      label: `${this.state} — ${position}`,
+      state: this.state,
+      position: position
+    };
+  }
+
+  classifyPosition(visualX) {
+    if (visualX < 0.33) return "LEFT";
+    if (visualX > 0.67) return "RIGHT";
+    return "CENTER";
+  }
+
+  updateTelemetry(avgKnee, lKnee, rKnee, hipDrop, ankleRise, velocity, visualX, squatScore) {
+    this.telemetry = {
+      state: this.state,
+      position: this.position,
+      calibrated: this.calibrated ? `Ready (100%)` : `Calibrating (${Math.round((this.calibrationFrames/this.targetCalibrationFrames)*100)}%)`,
+      leftKnee: Math.round(lKnee),
+      rightKnee: Math.round(rKnee),
+      avgKnee: Math.round(avgKnee),
+      baselineKnee: Math.round(this.baseline.kneeAngle),
+      hipDrop: hipDrop.toFixed(2),
+      squatScore: (squatScore * 100).toFixed(0) + "%",
+      ankleRise: ankleRise.toFixed(2),
+      velocity: (velocity >= 0 ? "+" : "") + velocity.toFixed(2),
+      visualX: visualX.toFixed(2),
+      squatDebounce: `${this.squatDebounce}/4`,
+      airborneFrames: `${this.airborneFrames}/3`
+    };
+  }
+}
+
+const classifier = new BodyPoseClassifier();
+
+// -------------------------------------------------------------
+// SKELETON VISUALIZER
+// -------------------------------------------------------------
+function drawSkeleton(lm) {
+  canvas.width = video.videoWidth || 640;
+  canvas.height = video.videoHeight || 480;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (!lm || lm.length === 0) return;
+
+  const d = new DrawingUtils(ctx);
+
+  // 1. Draw Skeleton Connections with cyan accent
+  d.drawConnectors(lm, PoseLandmarker.POSE_CONNECTIONS, {
+    color: "rgba(0, 229, 255, 0.75)",
+    lineWidth: 2.5
+  });
+
+  // 2. Custom Color-Coded Joints for inspection clarity
+  lm.forEach((pt, idx) => {
+    if ((pt.visibility ?? 1) < 0.3) return;
+    const x = (1 - pt.x) * canvas.width; // Mirrored for canvas video alignment
+    const y = pt.y * canvas.height;
+
+    let color = "#ffffff";
+    let radius = 3;
+
+    if (idx >= 0 && idx <= 10) { color = "#FFD700"; radius = 3; } // Head: Gold
+    else if (idx === 11 || idx === 12) { color = "#00E5FF"; radius = 5; } // Shoulders: Cyan
+    else if (idx === 23 || idx === 24) { color = "#FF4081"; radius = 5; } // Hips: Magenta
+    else if (idx === 25 || idx === 26) { color = "#00E676"; radius = 5; } // Knees: Emerald
+    else if (idx === 27 || idx === 28) { color = "#AEEA00"; radius = 4; } // Ankles: Lime
+    else if (idx >= 29 && idx <= 32) { color = "#FF9100"; radius = 3; } // Feet/Toes: Amber
+
+    ctx.beginPath();
+    ctx.arc(x, y, radius, 0, 2 * Math.PI);
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.5)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  });
+
+  // 3. Draw 33% / 66% Horizontal Region Dividers (Matching visual screen coordinates)
+  ctx.save();
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.15)";
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  [0.33, 0.67].forEach(xRatio => {
+    ctx.beginPath();
+    ctx.moveTo(canvas.width * xRatio, 0);
+    ctx.lineTo(canvas.width * xRatio, canvas.height);
+    ctx.stroke();
+  });
+  ctx.restore();
+}
+
+// -------------------------------------------------------------
+// MODEL INITIALIZATION & CAMERA LOOP
+// -------------------------------------------------------------
+async function loadModel() {
+  try {
+    const fileset = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/wasm"
+    );
+    landmarker = await PoseLandmarker.createFromOptions(fileset, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+        delegate: "GPU"
+      },
+      runningMode: "VIDEO",
+      numPoses: 1,
+      minPoseDetectionConfidence: 0.4,
+      minPosePresenceConfidence: 0.4,
+      minTrackingConfidence: 0.4
+    });
+    statusEl.textContent = "Camera: off · Pose model: ready";
+  } catch (err) {
+    statusEl.textContent = "Pose model failed to load. Check connection.";
+    console.error("Model load error:", err);
+  }
+}
+
+async function loop() {
+  if (!running) return;
+  if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const now = performance.now();
+    const result = landmarker ? landmarker.detectForVideo(video, now) : null;
+
+    if (result?.landmarks?.length) {
+      const lm = result.landmarks[0];
+      drawSkeleton(lm);
+
+      const r = classifier.processFrame(lm, now);
+      stateEl.textContent = r.label;
+      statusEl.textContent = `Camera: on · State: ${r.state}`;
+
+      if (showDebug) {
+        const t = classifier.telemetry;
+        debugEl.textContent = 
+          `Pose: ${t.state} | Position: ${t.position}\n` +
+          `Calibration: ${t.calibrated}\n` +
+          `Visual X (Screen): ${t.visualX}\n` +
+          `Squat Score: ${t.squatScore} (Debounce: ${t.squatDebounce})\n` +
+          `Left Knee: ${t.leftKnee}° | Right Knee: ${t.rightKnee}°\n` +
+          `Avg Knee: ${t.avgKnee}° (Baseline: ${t.baselineKnee}°)\n` +
+          `Hip Drop: ${t.hipDrop} | Velocity: ${t.velocity}\n` +
+          `Ankle Rise: ${t.ankleRise} | Airborne: ${t.airborneFrames}`;
+      }
+    } else {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      stateEl.textContent = "NO PERSON";
+      statusEl.textContent = "Camera: on · Pose: searching…";
+      if (showDebug) debugEl.textContent = "NO LANDMARKS DETECTED";
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+// -------------------------------------------------------------
+// EVENT HANDLERS
+// -------------------------------------------------------------
+startBtn.onclick = async () => {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
+      audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    running = true;
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    recalBtn.disabled = false;
+    classifier.reset();
+    statusEl.textContent = "Camera: on · Calibrating baseline…";
+    loop();
+  } catch (e) {
+    stateEl.textContent = "CAMERA BLOCKED";
+    statusEl.textContent = "Allow webcam access, then try again.";
+    console.error("Webcam access error:", e);
+  }
+};
+
+stopBtn.onclick = () => {
+  running = false;
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null;
+  video.srcObject = null;
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  recalBtn.disabled = true;
+  classifier.reset();
+  stateEl.textContent = "CAMERA OFF";
+  statusEl.textContent = "Camera: off · Pose model: ready";
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+};
+
+recalBtn.onclick = () => {
+  if (running) {
+    classifier.triggerRecalibration();
+    statusEl.textContent = "Camera: on · Recalibrating standing baseline…";
+  }
+};
+
+toggleDebugBtn.onclick = () => {
+  showDebug = !showDebug;
+  debugEl.classList.toggle("active", showDebug);
+  toggleDebugBtn.classList.toggle("sec", !showDebug);
+};
+
+loadModel();
+</script>
+</body>
+</html>
